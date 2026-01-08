@@ -518,6 +518,8 @@ EOF
     if nchunks < mpi_size:
       nchunks = mpi_size
       chunksize = int(nsteps/nchunks)
+      if mpi_rank == 0:
+          print("nchunks < mp_size. Resetting chunksize = ",chunksize)
   
   skiplist = np.zeros((mpi_size), dtype=int)
   chunklist = np.zeros((mpi_size), dtype=int)
@@ -525,12 +527,20 @@ EOF
   chunks_per_rank = int(nchunks/mpi_size)
   extra_chunks = nchunks % mpi_size
   extra_frames = nsteps - chunksize*nchunks
+  if extra_frames > chunksize:
+      if mpi_rank == 0:
+          print("extra_frames = {0}, chunksize = {1}, fixing".format(extra_frames, chunksize))
+      extra_chunks = extra_chunks + int(extra_frames/chunksize)
+      extra_frames = extra_frames - int(extra_frames/chunksize)*chunksize
+      if extra_chunks > mpi_size:
+        chunks_per_rank = chunks_per_rank + int(extra_chunks/mpi_size)
+        extra_chunks = extra_chunks - int(extra_chunks/mpi_size)*mpi_size
   if nchunks != mpi_size and extra_frames != 0:
-    extra_chunks = extra_chunks + chunks_per_rank
-    if extra_chunks >= mpi_size - 1:
-      chunks_per_rank = chunks_per_rank + 1
-      extra_chunks = extra_chunks - mpi_size + 1
+    chunks_per_rank = int(nchunks/(mpi_size-1))
+    extra_chunks = nchunks % (mpi_size - 1)
   ct = 0
+  if mpi_rank == 0:
+    print("nchunks = {0}, extra_chunks = {1}, chunks_per_rank = {2}, extra_frames = {3}".format(nchunks,extra_chunks,chunks_per_rank,extra_frames))
   for i in range(mpi_size):
     if (i == 0):
       skiplist[i] = first
@@ -562,7 +572,7 @@ EOF
     stime = time.time()
     print("Will use ",ct," frames distributed over ",mpi_size," workers")
     if (mpi_size == nchunks):
-      print("Each worker will handle ",chunks_per_rank," chunks of ",chunksize," frames with one extra frame in the first ",extra_frames," workers")
+      print("Each worker will handle ",chunks_per_rank," chunks of ",chunksize," frames with one extra frame in the first ",extra_chunks," workers")
     else:
       print("Each worker will handle ",chunks_per_rank," chunks of ",chunksize," frames with one extra chunk in the first ",extra_chunks," workers.")
       if extra_frames != 0:
