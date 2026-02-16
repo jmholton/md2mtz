@@ -41,7 +41,7 @@ def calc_msd(x):
     msd += np.sum(d[:,k] * d[:,k])
     return msd
 
-def write_nexus_metadata(h5_file, fcalc_array, icalc_array):
+def write_nexus_metadata(h5_file, miller_array):
   """Helper to map cctbx symmetry to NeXus groups."""
   # 1. Create Entry
   entry = h5_file.require_group("entry")
@@ -52,8 +52,8 @@ def write_nexus_metadata(h5_file, fcalc_array, icalc_array):
   sample.attrs["NX_class"] = "NXsample"
 
   # Extract unit cell and space group
-  uc = fcalc_array.crystal_symmetry().unit_cell().parameters()
-  sg = str(fcalc_array.crystal_symmetry().space_group_info())
+  uc = miller_array.crystal_symmetry().unit_cell().parameters()
+  sg = str(miller_array.crystal_symmetry().space_group_info())
 
   # Write attributes
   dset_uc = sample.create_dataset("unit_cell", data=uc)
@@ -64,14 +64,10 @@ def write_nexus_metadata(h5_file, fcalc_array, icalc_array):
   refl.attrs["NX_class"] = "NXdata"
   
   # Convert flex.miller_index to numpy (N, 3)
-  indices = fcalc_array.indices().as_vec3_double().as_double().as_numpy_array().reshape(-1, 3)
+  indices = miller_array.indices().as_vec3_double().as_double().as_numpy_array().reshape(-1, 3)
   refl.create_dataset("hkl", data=indices)
   
-  # Convert data (Structure Factors / Intensities)
-  # If complex (Fcalc/Fobs), h5py requires a compound type or two datasets
-  refl.create_dataset("fcalc_real", data=np.real(fcalc_array.data().as_numpy_array()))
-  refl.create_dataset("fcalc_imag", data=np.imag(fcalc_array.data().as_numpy_array()))
-  refl.create_dataset("icalc", data=icalc_array.data().as_numpy_array())
+  refl.create_dataset("diffuse", data=miller_array.data().as_numpy_array())
                         
 if __name__=="__main__":
   import sys
@@ -204,6 +200,14 @@ if __name__=="__main__":
   else:
     diffuse_data_file = args.pop(idx).split("=")[1]
 
+# filtered frames file
+
+  try:
+    idx = [a.find("filtered_file")==0 for a in args].index(True)
+  except ValueError:
+    filtered_file = None
+  else:
+    filtered_file = args.pop(idx).split("=")[1]
 # density map
 
 #  try:
@@ -388,11 +392,6 @@ if __name__=="__main__":
   else:
     nsteps_ref = int(args.pop(idx).split("=")[1])
 
-  if use_top_bfacs:
-    if apply_bfac:
-      print("Setting apply_bfac = False as use_top_bfacs = True")
-      apply_bfac = False
-      
 # Initialize MPI
 
   if mpi_enabled():
@@ -407,6 +406,12 @@ if __name__=="__main__":
     mpi_rank = 0
     mpi_size = 1
 
+  if use_top_bfacs:
+    if apply_bfac:
+      if mpi_rank == 0:
+        print("Setting apply_bfac = False as use_top_bfacs = True")
+      apply_bfac = False
+      
 # If in diff_mode, read the reference .mtz files
 
   if diff_mode:
@@ -904,8 +909,6 @@ EOF
       stime = time.time()
       print("Doing optimization using ",ct," initial frames")
 
-    diffuse_expt_np = np.array(diffuse_expt_common.data())
-    C_ref = np.corrcoef(diffuse_expt_np,ct*tot_sig_icalc_np - (tot_sig_fcalc_np * tot_sig_fcalc_np.conjugate()).real)[0,1]
     #Initialize correlations array
     w = np.ones(ct)
     ct_nonzero = ct
@@ -914,38 +917,87 @@ EOF
     #Get the slice for the section handled by this rank
     C_all_this = np.zeros(ct)
     C_this = C_all_this[first_this:last_this+1]
+    w_indices = None
+    if filtered_file is not None:
+      w_indices = np.loadtxt(filtered_file,dtype=int)
+      w[w_indices] = 0
+      ct_nonzero=np.count_nonzero(w)
+      if mpi_rank == 0:
+        print("Filtered frames from ",filtered_file,", ",ct_nonzero," out of ",ct," remaining")
     w_this = w[first_this:last_this+1]
     keep_optimizing = True
+    h5_mpi=False
+    
     if checkpoint_opt:
       if mpi_rank == 0:
         print("Writing checkpoint file on rank 0")
         with h5py.File("checkpoint.nxs", "w") as f:
           f.attrs["NX_class"] = "NXroot"
           
-          # Only Rank 0 writes the miller_array content
-          # But because creating groups is a 'metadata' operation,
-          # all ranks should technically be outside the 'if rank == 0' for the create_group calls
-          # or ensure they wait at a barrier.
-          write_nexus_metadata(f, avg_fcalc, avg_icalc)
+          write_nexus_metadata(f, diffuse_expt_common)
             
       # Wait for Rank 0 to finish metadata definitions
       mpi_comm.Barrier()
-      
       # --- Parallel Numpy Writing (All Ranks) ---
-      with h5py.File("checkpoint.nxs", "a", driver="mpio", comm=mpi_comm) as f:
-        data_shape = (last-first+1,fcalc_list.shape[1],2)
-        dset = f.create_dataset("entry/data/fcalc_list", data_shape, dtype=np.float32)
+      if h5_mpi:
+        with h5py.File("checkpoint.nxs", "a", driver="mpio", comm=mpi_comm) as f:
+          data_shape = (last-first+1,fcalc_list.shape[1],2)
+          dset = f.create_dataset("entry/data/fcalc_list", data_shape, dtype=np.float32)
                   
-        with dset.collective:
           dset[first_this:last_this+1, :, :] = np.stack((np.real(fcalc_list),np.imag(fcalc_list)),axis=-1).astype(np.float32)
 
-        data_shape = (last-first+1)
-        dset = f.create_dataset("entry/data/weights",data_shape,dtype=np.float32)
-        with dset.collective:
+          data_shape = (last-first+1)
+          dset = f.create_dataset("entry/data/weights",data_shape,dtype=np.float32)
           dset[first_this:last_this+1] = w_this.astype(np.float32)
-          
-        if mpi_rank == 0:
-          print("Nexus file successfully written with cctbx metadata and parallel arrays.")
+      else:
+        for i in range(mpi_size):
+          if work_rank == i:
+            if work_rank == 0:          
+              with h5py.File("checkpoint.nxs", "a") as f:
+                print("Worker 0 creating the datasets")
+                data_shape = (last-first+1,fcalc_list.shape[1],2)
+                dset = f.create_dataset("entry/data/fcalc_list", data_shape, dtype=np.float32)
+                data_shape = (last-first+1)
+                dset = f.create_dataset("entry/data/weights",data_shape,dtype=np.float32)
+            print("Worker ",work_rank," writing fcalc_list with ",fcalc_list.nbytes/2/1024/1024," MB")  
+            with h5py.File("checkpoint.nxs", "a") as f:            
+              dset = f["entry/data/fcalc_list"]
+              dset[first_this:last_this+1, :, :] = np.stack((np.real(fcalc_list),np.imag(fcalc_list)),axis=-1).astype(np.float32)
+              dset = f["entry/data/weights"]
+              dset[first_this:last_this+1] = w_this.astype(np.float32)
+          mpi_comm.Barrier()
+      if mpi_rank == 0:
+        print("Nexus file successfully written with cctbx metadata and parallel arrays.")          
+
+    with open("deleted_frames.txt","w") as f:
+      if (w_indices is not None):
+        for x in range(len(w_indices)):
+          f.write("{0}\n".format(w_indices[x]))
+    for x in range(len(fcalc_list)):
+        if w_this[x] == 0:
+          try:
+            sig_fcalc_np = sig_fcalc_np - fcalc_list[x]
+          except TypeError:
+            print("Couldn't calculate fcalc difference on worker ",work_rank," with len(C_this), ct_nonzero, x = ",len(C_this),ct_nonzero,x)
+            print("Types of tot_sig_fcalc_np, fcalc_list[x] = ",type(tot_sig_fcalc_np),type(fcalc_list[x]))
+          try:            
+            sig_icalc_np = sig_icalc_np - icalc_list[x]
+          except:
+            print("Couldn't calculate icalc difference on worker ",work_rank," with len(C_this), ct_nonzero, x = ",len(C_this),ct_nonzero,x)
+            print("Types of tot_sig_icalc_np, icalc_list[x] = ",type(tot_sig_icalc_np),type(icalc_list[x]))
+    if mpi_enabled():
+      mpi_comm.Allreduce(sig_fcalc_np,tot_sig_fcalc_np,op=MPI.SUM)
+      mpi_comm.Allreduce(sig_icalc_np,tot_sig_icalc_np,op=MPI.SUM)
+    else:
+      tot_sig_fcalc_np = sig_fcalc_np
+      tot_sig_icalc_np = sig_icalc_np
+
+    diffuse_this = (ct_nonzero*tot_sig_icalc_np - tot_sig_fcalc_np * tot_sig_fcalc_np.conjugate()).real
+    diffuse_expt_np = np.array(diffuse_expt_common.data())
+    C_ref = np.corrcoef(np.array([diffuse_expt_np,diffuse_this]))[0,1]
+    if mpi_rank == 0:
+      print("Initial correlation after filtering = ",C_ref)
+      
     while keep_optimizing:
       C_this[:] = 0
 #      print("Worker = ",work_rank,"ct = ",ct,"len(C_this) = ",len(C_this),first_this,last_this)
@@ -988,11 +1040,14 @@ EOF
         w[maxind] = 0
         if mpi_rank == 0:
           print("Max correlation, index = ",C_ref,maxind)
+          with open("deleted_frames.txt","a") as f:
+            f.write("{0}\n".format(maxind))
       else:
         keep_optimizing = False
     if (mpi_rank == 0):
       etime = time.time()
       print("TIMING: Optimization took ",etime-stime," secs")
+      print("Final correlation is ",C_ref)
       print("Total ",ct_nonzero+1," frames remaining (see selected_frames.ndx)")
       keep_idx = np.where(w!=0)
       print(keep_idx[0])
