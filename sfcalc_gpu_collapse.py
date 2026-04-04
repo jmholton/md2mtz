@@ -3,30 +3,32 @@
 sfcalc_gpu_collapse.py
 ======================
 GPU-accelerated structure factor calculation from a P1 supercell PDB,
-with collapse of supercell reflections to the primitive-cell ASU.
+producing two MTZ outputs for diffuse scatter computation:
 
-For each primitive-cell ASU reflection (H,K,L) the structure factor is
-assembled by summing over the symmetry operators of the small space group:
+  outI    -- supercell squared amplitudes   I(h,k,l) = |F_super(h,k,l)|²
+             in P1 supercell space; average across MD frames gives <|F|²>
 
-    F_SG(H,K,L) = Σ_i  exp(2πi H·t_i) * F_super(na*R_i^T H, nb*K_rot, nc*L_rot)
+  outmtz  -- primitive-cell ASU structure factors  FC, PHIC
+             collapsed from the supercell via:
+             F_SG(H,K,L) = Σ_i  exp(2πi H·t_i) * F_super(na*R_i^T H, ...)
+             average across MD frames gives <F>; then |<F>|² = <F_avg>²
 
-where (R_i^T H, ...) are the Miller indices in the primitive cell obtained by
-applying the TRANSPOSED direct-space rotation of operator i, and t_i is its
-translation part.  F_super is read directly from the GPU FFT accumulator
-arrays (with Friedel-mate conjugation for negative-H indices).
+Diffuse scatter: I_diffuse(H) = <|F_SG(H)|²> - |<F_SG(H)>|²
 
-If super_mult=1,1,1 and sg=P1 the output is identical to sfcalc_gpu.py.
+If super_mult=1,1,1 and sg=P1 both outputs cover the same P1 ASU reflections.
 
 Usage
 -----
   sfcalc_gpu_collapse.py  input.pdb
       [dmin=1.5]  [rate=2.5]
       [sg=P1]  [super_mult=1,1,1]
-      [outmtz=collapsed.mtz]  [outmap=]
+      [outmtz=collapsed.mtz]  [outI=supercell_I.mtz]  [outmap=]
       [bmax=0]  [noise=0.01]  [lib=sfcalc_gpu.so]
 
   sg          : space group of the PRIMITIVE cell  (default P1)
   super_mult  : supercell multipliers na,nb,nc      (default 1,1,1)
+  outmtz      : primitive-cell ASU phased MTZ       (FC + PHIC columns)
+  outI        : supercell intensity MTZ             (I column, P1 space)
 """
 
 import sys
@@ -52,6 +54,7 @@ def parse_args(argv):
         'dmin':       1.5,
         'rate':       2.5,
         'outmtz':     'collapsed.mtz',
+        'outI':       'supercell_I.mtz',
         'outmap':     '',
         'bmax':       0.0,
         'noise':      0.01,
@@ -67,6 +70,7 @@ def parse_args(argv):
             if   key == 'dmin':                    args['dmin']   = float(val)
             elif key == 'rate':                    args['rate']   = float(val)
             elif key in ('outmtz', 'mtz'):         args['outmtz'] = val
+            elif key in ('outi', 'outsq', 'outisq'):  args['outI'] = val
             elif key in ('outmap', 'map'):         args['outmap'] = val
             elif key in ('bmax', 'bmax_skip'):     args['bmax']   = float(val)
             elif key == 'noise':                   args['noise']  = float(val)
@@ -353,6 +357,26 @@ def write_mtz(H, K, L, amp, phi, cell, sg, outpath):
     print(f"  Written: {outpath}  ({len(out_data)} reflections)")
 
 
+def write_mtz_I(H, K, L, intensity, cell, outpath):
+    """Write a P1 intensity MTZ (supercell h,k,l + I = |F|² column)."""
+    sg_p1              = gemmi.find_spacegroup_by_name('P 1')
+    out_mtz            = gemmi.Mtz(with_base=False)
+    out_mtz.spacegroup = sg_p1
+    out_mtz.cell       = cell
+    base_ds = out_mtz.add_dataset("HKL_base");   base_ds.wavelength = 0.0
+    data_ds = out_mtz.add_dataset("SFCALC_GPU"); data_ds.wavelength = 1.0
+    ds_id   = data_ds.id
+    for label, ctype in [('H','H'),('K','H'),('L','H'),('I','J')]:
+        col = out_mtz.add_column(label, ctype)
+        col.dataset_id = 0 if ctype == 'H' else ds_id
+    out_data = np.column_stack([H.astype(np.float32), K.astype(np.float32),
+                                L.astype(np.float32), intensity.astype(np.float32)])
+    if len(out_data):
+        out_mtz.set_data(out_data)
+    out_mtz.write_to_file(outpath)
+    print(f"  Written: {outpath}  ({len(out_data)} reflections)")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -533,32 +557,40 @@ def main():
         print(f"  Written: {args['outmap']}")
 
     # ------------------------------------------------------------------
-    # 6. Collapse to primitive-cell ASU
+    # 6. Extract supercell P1 ASU reflections → write supercell I MTZ
+    # ------------------------------------------------------------------
+    print("Extracting supercell structure factors ...")
+    H_1d = np.arange(nx2, dtype=np.int32)
+    K_1d = np.arange(ny,  dtype=np.int32)
+    L_1d = np.arange(nz,  dtype=np.int32)
+    K_1d = np.where(K_1d > ny // 2, K_1d - ny, K_1d)
+    L_1d = np.where(L_1d > nz // 2, L_1d - nz, L_1d)
+    H3 = H_1d[None, None, :];  K3 = K_1d[None, :, None];  L3 = L_1d[:, None, None]
+    inv_d2    = (H3 / ax) ** 2 + (K3 / ay) ** 2 + (L3 / az) ** 2
+    inv_dmin2 = 1.0 / (dmin * dmin)
+    asu_p1    = ((L3 > 0) | ((L3 == 0) & (K3 > 0)) | ((L3 == 0) & (K3 == 0) & (H3 > 0)))
+    sc_mask   = (inv_d2 <= inv_dmin2) & asu_p1
+
+    re_sc = acc_real[sc_mask];  im_sc = acc_imag[sc_mask]
+    H_sc  = np.broadcast_to(H3, (nz, ny, nx2))[sc_mask].astype(np.float32)
+    K_sc  = np.broadcast_to(K3, (nz, ny, nx2))[sc_mask].astype(np.float32)
+    L_sc  = np.broadcast_to(L3, (nz, ny, nx2))[sc_mask].astype(np.float32)
+
+    if args['outI']:
+        I_sc = (re_sc.astype(np.float64) ** 2 +
+                im_sc.astype(np.float64) ** 2).astype(np.float32)
+        write_mtz_I(H_sc, K_sc, L_sc, I_sc, cell, args['outI'])
+
+    # ------------------------------------------------------------------
+    # 7. Collapse to primitive-cell ASU → write phased MTZ
     # ------------------------------------------------------------------
     simple_p1 = (na == 1 and nb == 1 and nc == 1 and sg.hm == 'P 1')
 
     if simple_p1:
-        # Fast path: just extract the P1 supercell ASU (same as sfcalc_gpu.py)
-        print("Extracting P1 ASU structure factors ...")
-        H_1d = np.arange(nx2, dtype=np.int32)
-        K_1d = np.arange(ny,  dtype=np.int32)
-        L_1d = np.arange(nz,  dtype=np.int32)
-        K_1d = np.where(K_1d > ny // 2, K_1d - ny, K_1d)
-        L_1d = np.where(L_1d > nz // 2, L_1d - nz, L_1d)
-        inv_d2    = ((H_1d[None, None, :] / ax) ** 2 +
-                     (K_1d[None, :,  None] / ay) ** 2 +
-                     (L_1d[:,  None, None] / az) ** 2)
-        inv_dmin2 = 1.0 / (dmin * dmin)
-        H3 = H_1d[None, None, :];  K3 = K_1d[None, :, None];  L3 = L_1d[:, None, None]
-        asu_mask = ((L3 > 0) | ((L3 == 0) & (K3 > 0)) | ((L3 == 0) & (K3 == 0) & (H3 > 0)))
-        mask = (inv_d2 <= inv_dmin2) & asu_mask
-        re_sel = acc_real[mask];  im_sel = acc_imag[mask]
-        amp    = np.hypot(re_sel, im_sel).astype(np.float32)
-        phi    = np.degrees(np.arctan2(im_sel, re_sel)).astype(np.float32)
-        H_sel = np.broadcast_to(H3, (nz, ny, nx2))[mask].astype(np.float32)
-        K_sel = np.broadcast_to(K3, (nz, ny, nx2))[mask].astype(np.float32)
-        L_sel = np.broadcast_to(L3, (nz, ny, nx2))[mask].astype(np.float32)
-        write_mtz(H_sel, K_sel, L_sel, amp, phi, cell, sg, args['outmtz'])
+        # Fast path: supercell IS the primitive cell
+        amp = np.hypot(re_sc, im_sc).astype(np.float32)
+        phi = np.degrees(np.arctan2(im_sc, re_sc)).astype(np.float32)
+        write_mtz(H_sc, K_sc, L_sc, amp, phi, cell, sg, args['outmtz'])
 
     else:
         # General path: collapse supercell → primitive-cell ASU
