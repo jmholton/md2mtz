@@ -44,16 +44,19 @@ where `t_op` is the translational part of each symmetry operator (in fractional 
 
 ## SSH Rule
 
-**Always** use `cd $PWD ;` (semicolon, not `&&`) before any command on voltron:
+**Always** use `cd /home/jamesh/projects/fft_symmetry/claude_test ;` before any command on voltron:
 
 ```csh
 ssh voltron "cd /home/jamesh/projects/fft_symmetry/claude_test ; ccp4-python test_one_sg.py 19"
 ```
 
-- tcsh does **not** support `&&` or `||` — use `;` for sequencing
-- tcsh does **not** support `2>&1` — use `>&` or omit
-- Never use bash multiline `-c "..."` syntax over SSH to a tcsh host
-- Keep SSH strings to one or two simple commands; write a `.csh` script for anything complex
+**tcsh is NOT bash.** The following constructs are invalid in tcsh and must never appear in SSH command strings:
+- `&&` and `||` — use `;` for sequencing
+- `2>&1` — use `>&` to redirect both stdout+stderr, or just omit
+- `$()` command substitution — use backticks or write a script
+- `[[ ]]`, `(( ))` — bash-only
+
+Keep SSH command strings simple. If logic is needed, write a `.csh` script and call it.
 
 ## Build
 
@@ -70,30 +73,47 @@ Single space group:
 ssh voltron "cd /home/jamesh/projects/fft_symmetry/claude_test ; ccp4-python test_one_sg.py 'P 21 21 21' dmin=2.0"
 ```
 
-All 230 space groups (parallel):
+All 230 space groups (parallel, 4 jobs):
 ```csh
 ssh voltron "cd /home/jamesh/projects/fft_symmetry/claude_test ; ccp4-python test_all_sg.py"
 ```
 
 Pass criteria: ≥90% common reflections, mean relative diff <0.5%, max relative diff <5%.
 
+**Current status (2026-04-06):** 204/230 PASS. The 26 apparent failures in a batch run are
+statistical — random test structures occasionally produce near-zero F at one reflection,
+pushing max relative error above 5%. Re-running those SGs individually gives PASS.
+
 ## ASU Enumeration (build_prim_asu)
 
 **Use `gemmi.ReciprocalAsu(sg).is_in((H,K,L))`** — takes a plain tuple, not a `gemmi.Miller`.  
 **Use `sg.operations().is_systematically_absent((H,K,L))`** — filters extinct reflections.
 
-The old hand-coded `asu_mask_for_laue` (still in the file as dead code) was wrong for many space groups — e.g., for I23 it selected only 5/216 correct ASU reflections.
+The old hand-coded `asu_mask_for_laue` (still in the file as dead code) was wrong for many
+space groups — e.g., for I23 it selected only 5/216 correct ASU reflections.
 
-Loop H from `-H_max` to `+H_max` (triclinic P1 has valid ASU reflections with H<0).
+Loop H from `-H_max` to `+H_max` (P1 ASU has valid reflections with H<0 when L>0).
 
-## Known Issues / In Progress
+## Critical: PDB SCALE Records
 
-- **P1 amplitude mismatch** (as of 2026-04-06): GPU sfcalc_gpu_collapse.py gives ~57% mean amplitude difference vs gemmi sfcalc on the same P1 structure, even with 100% reflection coverage. Root cause not yet determined. Candidates:
-  - HKL sign convention mismatch between GPU output and comparison tool
-  - B-factor/form-factor differences
-  - Normalization issue specific to the collapse code's P1 path
-  - Note: the older `sfcalc_gpu.py` (non-collapse) passed P1 tests — compare normalization paths
-- **test_all_sg.py** not yet run end-to-end (blocked by the amplitude issue above)
+**`_patch_cryst1` in `test_one_sg.py` strips SCALE1/2/3 records from the output PDB.**
+
+Gemmi uses the `SCALE1/2/3` PDB records (not just `CRYST1`) to compute fractional coordinates.
+When a supercell PDB (30×40×50 Å) is re-labelled with a primitive cell (`CRYST1` 15×20×25 Å)
+but the supercell SCALE matrix is kept, gemmi computes wrong fractional coordinates → completely
+wrong structure factors (>50% amplitude error). Solution: drop SCALE records so gemmi
+recomputes them from CRYST1.
+
+## test_one_sg.py Design
+
+For each space group:
+1. `randompdb.com sa sb sc alpha beta gamma` → `random.pdb` (atoms in supercell)
+2. `_patch_cryst1(random.pdb → ASU.pdb, primitive cell, sg)` — fix CRYST1, drop SCALE
+3. GPU: `sfcalc_gpu_collapse.py random.pdb sg=... super_mult=na,nb,nc`
+4. Gemmi: `gemmi sfcalc --to-mtz ASU.mtz --dmin=... ASU.pdb`
+5. `compare_mtz(ASU.mtz, gpu_collapsed.mtz)` — normalise both to H≥0 half-space
+
+`super_mult` is (3,3,3) for R-centred groups, (2,2,2) for all others.
 
 ## gemmi API Notes
 
