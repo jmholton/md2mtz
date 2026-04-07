@@ -155,7 +155,8 @@ def b_threshold_for_level(L, pixel_fine, noise_frac):
 # GPU spreading helper  (same as sfcalc_gpu.py)
 # ---------------------------------------------------------------------------
 
-def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az, do_map=False):
+def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
+                alpha=90., beta=90., gamma=90., do_map=False):
     nx2   = nx // 2 + 1
     fft_n = nx2 * ny * nz
     _rbuf  = bytearray(fft_n * 4)
@@ -179,6 +180,7 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az, do_map=False):
         el.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         nx, ny, nz,
         ctypes.c_float(ax), ctypes.c_float(ay), ctypes.c_float(az),
+        ctypes.c_float(alpha), ctypes.c_float(beta), ctypes.c_float(gamma),
         ctypes.c_float(0.0),
         fptr(map_buf), fptr(F_real), fptr(F_imag),
     )
@@ -227,32 +229,47 @@ def asu_mask_for_laue(laue, H3, K3, L3):
         sys.exit(f"ERROR: unsupported Laue class '{laue}'")
 
 
-def build_prim_asu(sg, prim_ax, prim_ay, prim_az, dmin):
-    """Return (H, K, L) int32 arrays for all primitive-cell ASU reflections."""
-    H_max = int(math.floor(prim_ax / dmin))
-    K_max = int(math.floor(prim_ay / dmin))
-    L_max = int(math.floor(prim_az / dmin))
+def build_prim_asu(sg, prim_cell, dmin):
+    """Return (H, K, L) int32 arrays for all primitive-cell ASU reflections.
+    Uses gemmi.ReciprocalAsu to match gemmi's exact ASU convention and excludes
+    systematically absent reflections."""
+    rc = prim_cell.reciprocal()
+    H_max = int(math.ceil(1.0 / (dmin * rc.a)))
+    K_max = int(math.ceil(1.0 / (dmin * rc.b)))
+    L_max = int(math.ceil(1.0 / (dmin * rc.c)))
 
-    H_1d = np.arange(0, H_max + 1, dtype=np.int32)
-    K_1d = np.arange(-K_max, K_max + 1, dtype=np.int32)
-    L_1d = np.arange(-L_max, L_max + 1, dtype=np.int32)
-
-    # Use outer broadcasting without meshgrid to save memory
-    H3 = H_1d[:, None, None]
-    K3 = K_1d[None, :, None]
-    L3 = L_1d[None, None, :]
-
-    inv_d2    = (H3 / prim_ax)**2 + (K3 / prim_ay)**2 + (L3 / prim_az)**2
+    # Reciprocal metric tensor for general cell
+    rca = math.cos(math.radians(rc.alpha))
+    rcb = math.cos(math.radians(rc.beta))
+    rcg = math.cos(math.radians(rc.gamma))
+    gs11 = rc.a**2;  gs22 = rc.b**2;  gs33 = rc.c**2
+    gs12 = rc.a * rc.b * rcg
+    gs13 = rc.a * rc.c * rcb
+    gs23 = rc.b * rc.c * rca
     inv_dmin2 = 1.0 / (dmin * dmin)
 
-    laue     = sg.laue_str()
-    asu_mask = asu_mask_for_laue(laue, H3, K3, L3)
-    mask     = (inv_d2 > 0) & (inv_d2 <= inv_dmin2) & asu_mask
+    asu = gemmi.ReciprocalAsu(sg)
+    ops = sg.operations()
 
-    H_out = np.broadcast_to(H3, mask.shape)[mask].astype(np.int32)
-    K_out = np.broadcast_to(K3, mask.shape)[mask].astype(np.int32)
-    L_out = np.broadcast_to(L3, mask.shape)[mask].astype(np.int32)
-    return H_out, K_out, L_out
+    Hlist, Klist, Llist = [], [], []
+    for H in range(-H_max, H_max + 1):
+        for K in range(-K_max, K_max + 1):
+            for L in range(-L_max, L_max + 1):
+                if not asu.is_in((H, K, L)):
+                    continue
+                inv_d2 = (H*H*gs11 + K*K*gs22 + L*L*gs33
+                          + 2*(H*K*gs12 + H*L*gs13 + K*L*gs23))
+                if inv_d2 <= 0 or inv_d2 > inv_dmin2:
+                    continue
+                if ops.is_systematically_absent((H, K, L)):
+                    continue
+                Hlist.append(H)
+                Klist.append(K)
+                Llist.append(L)
+
+    return (np.array(Hlist, dtype=np.int32),
+            np.array(Klist, dtype=np.int32),
+            np.array(Llist, dtype=np.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -408,10 +425,6 @@ def main():
     ax, ay, az = cell.a, cell.b, cell.c
     print(f"  Supercell: {ax:.3f} x {ay:.3f} x {az:.3f}  "
           f"angles: {cell.alpha:.2f} {cell.beta:.2f} {cell.gamma:.2f}")
-    if (abs(cell.alpha - 90) > 0.01 or abs(cell.beta  - 90) > 0.01
-                                     or abs(cell.gamma - 90) > 0.01):
-        sys.exit("ERROR: GPU kernel currently only supports orthogonal cells")
-
     prim_ax = ax / na;  prim_ay = ay / nb;  prim_az = az / nc
     prim_cell = gemmi.UnitCell(prim_ax, prim_ay, prim_az,
                                cell.alpha, cell.beta, cell.gamma)
@@ -457,7 +470,7 @@ def main():
 
     d0, nx, ny, nz = levels[0]
     nx2    = nx // 2 + 1
-    V_cell = ax * ay * az
+    V_cell = cell.volume
     w_px   = noise_wpx(noise)
 
     last_occupied = max((L for L in range(n_levels) if (atom_lev == L).any()),
@@ -487,8 +500,9 @@ def main():
         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_int),
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_float, ctypes.c_float, ctypes.c_float,
-        ctypes.c_float,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,   # ax, ay, az
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,   # alpha, beta, gamma
+        ctypes.c_float,                                    # Bmax_skip
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
@@ -518,6 +532,7 @@ def main():
             x_arr[mask_L], y_arr[mask_L], z_arr[mask_L],
             B_arr[mask_L], el_arr[mask_L],
             nx_L, ny_L, nz_L, ax, ay, az,
+            cell.alpha, cell.beta, cell.gamma,
             do_map=(do_map and L == 0),
         )
         t1 = time.perf_counter()
@@ -597,7 +612,7 @@ def main():
         print(f"Collapsing supercell to primitive-cell ASU "
               f"({sg.xhm()}, {len(list(sg.operations()))} operators) ...")
         t0 = time.perf_counter()
-        H_asu, K_asu, L_asu = build_prim_asu(sg, prim_ax, prim_ay, prim_az, dmin)
+        H_asu, K_asu, L_asu = build_prim_asu(sg, prim_cell, dmin)
         t1 = time.perf_counter()
         print(f"  Primitive-cell ASU reflections: {len(H_asu)}  "
               f"(enumerated in {(t1-t0)*1000:.0f} ms)")
