@@ -97,6 +97,37 @@ CCP4 programs `SCALEIT`, `CAD`, and `ADDUP` can assist with step 1. Steps 2–3 
 
 Atoms are assigned to FFT grid levels based on their isotropic B-factor, so high-B (diffuse) atoms are spread on coarser grids and low-B (well-ordered) atoms use the full fine grid. This reduces GPU memory and time without sacrificing accuracy. The `noise` parameter controls the coarsening threshold (default 1%).
 
+## Accuracy
+
+Validated against gemmi's direct-sum structure factor calculator on a 1000-atom, 170 Å orthorhombic P1 cell at `dmin=2.0` Å (585 k reflections):
+
+| F bin | N reflections | Mean rel. diff | Max rel. diff |
+|-------|--------------|----------------|---------------|
+| F > 100 | 130 004 | **0.028%** | 0.4% |
+| 10 < F ≤ 100 | 445 099 | 0.13% | 4.0% |
+| 1 < F ≤ 10 | 9 994 | 1.0% | 23% |
+| F ≤ 1 | 102 | 7.7% | 47% |
+
+Errors at weak reflections are dominated by near-zero denominators, not systematic bias. All 230 space groups pass an independent collapse test vs `gemmi sfcalc` (mean <0.5%, max <5%).
+
+### Aliasing correction
+
+The IT92 form factors include a constant term `c` (effective `b = 0`) that would be sub-pixel at low B-factors, causing ~0.7% aliasing error per Å² of B. The code applies **auto-blur** (identical to gemmi's approach): a correction `b_add = (dmin·rate)²/π²` is added to every atom's B-factor before spreading, and the resulting `exp(−b_add·stol²)` envelope is divided out of each F(H) after the FFT. At `dmin=2.0`, `rate=2.5`: `b_add = 2.53 Å²`, `σ_min = 0.25 Å` (pixel = 0.40 Å).
+
+## Performance
+
+Benchmarked on an NVIDIA Volta GPU (sm_70) with the same 1000-atom 170 Å cell:
+
+| Precision | Total wall time | L0 GPU call | L0 FFT kernel |
+|-----------|----------------|-------------|---------------|
+| float64 (D2Z FFT) | 2843 ms | 1626 ms | 11.2 ms |
+| **float32 (R2C FFT)** | **1912 ms** | **1129 ms** | **5.3 ms** |
+| Speedup | **1.49×** | 1.44× | **2.1×** |
+
+The pipeline uses float32 throughout (grid accumulation, R2C FFT, output); the per-atom Gaussian evaluation was already float32. Switching from float64/D2Z to float32/R2C halves all device memory sizes (cudaMalloc, cudaMemset, PCIe transfer), which dominates wall time. Accuracy is unaffected: the float32 noise floor (~10⁻⁷) is 2500× below the 0.03% grid-discretisation error.
+
+For a 10 000-atom MD trajectory at `dmin=2.0` with a 2×2×2 supercell (~150 Å cell), expect roughly 5–10 s per frame on a modern NVIDIA GPU.
+
 ## Testing
 
 Validate the GPU collapse against a gemmi reference for any space group:
