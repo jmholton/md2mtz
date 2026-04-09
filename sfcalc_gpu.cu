@@ -137,17 +137,31 @@ __global__ void precompute_atoms(
 // which is orders of magnitude faster when atoms are sparse relative to voxels.
 // Uses __expf (fast single-precision exp, ~1 ULP error) for speed.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Kernel 2: one thread per atom, general metric tensor.
+//
+// For orthogonal cells: g12=g13=g23=0, rfx=1/ax, rfy=1/ay, rfz=1/az,
+//   schur33=az^2.  Performance identical to the old kernel.
+//
+// For non-orthogonal cells (e.g. hexagonal H32 with gamma=120°):
+//   g12 = ax*ay*cos(gamma), etc.  rfx,rfy,rfz are derived from the inverse
+//   metric tensor so the bounding box is still tight.  schur33 = G_Schur[2,2]
+//   is the minimum r^2 contribution from dfz alone, enabling the z early exit.
+// ---------------------------------------------------------------------------
 __global__ void spread_kernel_atom(
     int natoms,
     int nx, int ny, int nz,
-    float ax, float ay, float az,
+    float g11, float g22, float g33,   // diagonal metric tensor (= ax^2,ay^2,az^2)
+    float g12, float g13, float g23,   // off-diagonal metric tensor
+    float schur33,                     // Schur complement [2,2]; z-loop lower bound
+    float rfx, float rfy, float rfz,   // bounding box: max fractional extent per unit rc
     const float* __restrict__ xf,
     const float* __restrict__ yf,
     const float* __restrict__ zf,
     const float* __restrict__ pre_all,
     const float* __restrict__ wk_all,
     const float* __restrict__ rcut2_arr,
-    float* __restrict__ rho
+    double* __restrict__ rho
 )
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -158,38 +172,38 @@ __global__ void spread_kernel_atom(
     float rc  = sqrtf(rc2);
 
     // Bounding box in unbounded grid-index space (periodic wrap applied below)
-    int ix0 = (int)floorf((xi - rc / ax) * (float)nx) - 1;
-    int ix1 = (int)ceilf ((xi + rc / ax) * (float)nx) + 1;
-    int iy0 = (int)floorf((yi - rc / ay) * (float)ny) - 1;
-    int iy1 = (int)ceilf ((yi + rc / ay) * (float)ny) + 1;
-    int iz0 = (int)floorf((zi - rc / az) * (float)nz) - 1;
-    int iz1 = (int)ceilf ((zi + rc / az) * (float)nz) + 1;
+    int ix0 = (int)floorf((xi - rc * rfx) * (float)nx) - 1;
+    int ix1 = (int)ceilf ((xi + rc * rfx) * (float)nx) + 1;
+    int iy0 = (int)floorf((yi - rc * rfy) * (float)ny) - 1;
+    int iy1 = (int)ceilf ((yi + rc * rfy) * (float)ny) + 1;
+    int iz0 = (int)floorf((zi - rc * rfz) * (float)nz) - 1;
+    int iz1 = (int)ceilf ((zi + rc * rfz) * (float)nz) + 1;
 
     const float* pre = pre_all + i * NG1;
     const float* wk  = wk_all  + i * NG1;
 
     for (int kz = iz0; kz <= iz1; kz++) {
-        float dz  = ((float)kz / (float)nz - zi) * az;
-        float dz2 = dz * dz;
-        if (dz2 >= rc2) continue;
+        float dfz = (float)kz / (float)nz - zi;
+        // schur33*dfz^2 = min r^2 over all dfx,dfy for this dfz
+        if (schur33 * dfz * dfz >= rc2) continue;
         int gz = ((kz % nz) + nz) % nz;
 
         for (int ky = iy0; ky <= iy1; ky++) {
-            float dy   = ((float)ky / (float)ny - yi) * ay;
-            float dyz2 = dy * dy + dz2;
-            if (dyz2 >= rc2) continue;
+            float dfy = (float)ky / (float)ny - yi;
             int gy = ((ky % ny) + ny) % ny;
 
             for (int kx = ix0; kx <= ix1; kx++) {
-                float dx = ((float)kx / (float)nx - xi) * ax;
-                float r2 = dx * dx + dyz2;
+                float dfx = (float)kx / (float)nx - xi;
+                // Full metric tensor distance
+                float r2 = g11*dfx*dfx + g22*dfy*dfy + g33*dfz*dfz
+                         + 2.0f*(g12*dfx*dfy + g13*dfx*dfz + g23*dfy*dfz);
                 if (r2 >= rc2) continue;
                 int gx = ((kx % nx) + nx) % nx;
 
                 float val = 0.f;
                 for (int k = 0; k < NG1; k++)
                     val += pre[k] * __expf(-wk[k] * r2);
-                atomicAdd(&rho[gx + nx * (gy + ny * gz)], val);
+                atomicAdd(&rho[gx + nx * (gy + ny * gz)], (double)val);
             }
         }
     }
@@ -201,11 +215,18 @@ __global__ void spread_kernel_atom(
 // cudaMemcpy write), by doing the split on the device then copying two
 // contiguous float arrays to pre-faulted host buffers.
 // ---------------------------------------------------------------------------
-__global__ void deinterleave_kernel(size_t n, const cufftComplex* __restrict__ src,
-                                    float* __restrict__ re, float* __restrict__ im)
+__global__ void deinterleave_kernel(size_t n, const cufftDoubleComplex* __restrict__ src,
+                                    double* __restrict__ re, double* __restrict__ im)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { re[i] = src[i].x; im[i] = src[i].y; }
+}
+
+__global__ void double_to_float_kernel(size_t n, const double* __restrict__ src,
+                                        float* __restrict__ dst)
+{
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (float)src[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -215,20 +236,61 @@ extern "C" {
 
 int spread_and_fft(
     int natoms,
-    float *x_orth,   // orthogonal coordinates in Angstroms
+    float *x_orth,   // orthogonal (Cartesian) coordinates in Angstroms
     float *y_orth,
     float *z_orth,
     float *B,
     int   *elem,
     int nx, int ny, int nz,
-    float ax, float ay, float az,
+    float ax, float ay, float az,         // cell edge lengths in Angstroms
+    float alpha_deg, float beta_deg, float gamma_deg,  // cell angles in degrees
     float Bmax_skip,         // skip atoms with B > Bmax_skip (0 = keep all)
-    float *map_out,          // output real-space map nx*ny*nz float32 (may be NULL)
-    float *F_real,           // output Re(F), size (nx/2+1)*ny*nz (may be NULL)
-    float *F_imag            // output Im(F), same size (may be NULL)
+    float  *map_out,         // output real-space map nx*ny*nz float32 (may be NULL)
+    double *F_real,          // output Re(F), size (nx/2+1)*ny*nz float64 (may be NULL)
+    double *F_imag           // output Im(F), same size float64 (may be NULL)
 )
 {
-    // Convert to fractional, filter high-B atoms
+    // ----- Fractionalization matrix (general triclinic cell) -----
+    // Standard orientation: a along x, b in xy-plane.
+    // M_inv converts Cartesian -> fractional:
+    //   xf = f00*X + f01*Y + f02*Z
+    //   yf =         f11*Y + f12*Z
+    //   zf =                 f22*Z
+    const float PI = 3.14159265358979f;
+    float ca = cosf(alpha_deg * PI / 180.0f);
+    float cb = cosf(beta_deg  * PI / 180.0f);
+    float cg = cosf(gamma_deg * PI / 180.0f);
+    float sg = sinf(gamma_deg * PI / 180.0f);
+    // Volume fraction: V = sqrt(1 - ca^2 - cb^2 - cg^2 + 2*ca*cb*cg)
+    float V   = sqrtf(1.0f - ca*ca - cb*cb - cg*cg + 2.0f*ca*cb*cg);
+    float f00 = 1.0f / ax;
+    float f01 = -cg / (ax * sg);
+    float f02 = (ca*cg - cb) / (ax * V * sg);
+    float f11 = 1.0f / (ay * sg);
+    float f12 = (cb*cg - ca) / (ay * V * sg);
+    float f22 = sg / (az * V);
+
+    // ----- Metric tensor G  (G_ij = a_i · a_j) -----
+    float g11 = ax*ax,             g22 = ay*ay,             g33 = az*az;
+    float g12 = ax*ay*cg,          g13 = ax*az*cb,          g23 = ay*az*ca;
+
+    // ----- Inverse metric tensor diagonals (for bounding box rfx,rfy,rfz) -----
+    // det of 2x2 upper-left block
+    float det_ab = g11*g22 - g12*g12;
+    // det of full G
+    float det_G  = g33*det_ab - g22*g13*g13 + 2.0f*g12*g13*g23 - g11*g23*g23;
+    float Ginv11 = (g22*g33 - g23*g23) / det_G;
+    float Ginv22 = (g11*g33 - g13*g13) / det_G;
+    float Ginv33 = det_ab / det_G;
+    float rfx = sqrtf(Ginv11);   // max fractional extent per unit rc along a
+    float rfy = sqrtf(Ginv22);   // ... along b
+    float rfz = sqrtf(Ginv33);   // ... along c
+
+    // ----- Schur complement [2,2]: lower bound on r^2 per dfz^2 -----
+    // r^2_min(dfz) = schur33 * dfz^2  allows z-loop early exit
+    float schur33 = g33 - (g22*g13*g13 - 2.0f*g12*g13*g23 + g11*g23*g23) / det_ab;
+
+    // ----- Fractionalize atoms, filter high-B -----
     float *xf_all = (float*)malloc(natoms * sizeof(float));
     float *yf_all = (float*)malloc(natoms * sizeof(float));
     float *zf_all = (float*)malloc(natoms * sizeof(float));
@@ -238,13 +300,14 @@ int spread_and_fft(
     int nkeep = 0;
     for (int i = 0; i < natoms; i++) {
         if (Bmax_skip > 0 && B[i] > Bmax_skip) continue;
-        xf_all[nkeep] = x_orth[i] / ax;
-        yf_all[nkeep] = y_orth[i] / ay;
-        zf_all[nkeep] = z_orth[i] / az;
+        float X = x_orth[i], Y = y_orth[i], Z = z_orth[i];
+        float xf = f00*X + f01*Y + f02*Z;
+        float yf =         f11*Y + f12*Z;
+        float zf =                 f22*Z;
         // Wrap into [0,1)
-        xf_all[nkeep] -= floorf(xf_all[nkeep]);
-        yf_all[nkeep] -= floorf(yf_all[nkeep]);
-        zf_all[nkeep] -= floorf(zf_all[nkeep]);
+        xf_all[nkeep] = xf - floorf(xf);
+        yf_all[nkeep] = yf - floorf(yf);
+        zf_all[nkeep] = zf - floorf(zf);
         B_all [nkeep] = B[i];
         el_all[nkeep] = elem[i];
         nkeep++;
@@ -254,17 +317,18 @@ int spread_and_fft(
 
     // Allocate device memory
     size_t grid_size = (size_t)nx * ny * nz;
-    float *d_xf, *d_yf, *d_zf, *d_B, *d_rho;
-    int   *d_el;
+    float  *d_xf, *d_yf, *d_zf, *d_B;
+    double *d_rho;
+    int    *d_el;
 
     cudaMalloc(&d_xf,  nkeep * sizeof(float));
     cudaMalloc(&d_yf,  nkeep * sizeof(float));
     cudaMalloc(&d_zf,  nkeep * sizeof(float));
     cudaMalloc(&d_B,   nkeep * sizeof(float));
     cudaMalloc(&d_el,  nkeep * sizeof(int));
-    cudaMalloc(&d_rho, grid_size * sizeof(float));
+    cudaMalloc(&d_rho, grid_size * sizeof(double));
 
-    cudaMemset(d_rho, 0, grid_size * sizeof(float));
+    cudaMemset(d_rho, 0, grid_size * sizeof(double));
 
     cudaMemcpy(d_xf, xf_all, nkeep * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_yf, yf_all, nkeep * sizeof(float), cudaMemcpyHostToDevice);
@@ -296,7 +360,9 @@ int spread_and_fft(
         int threads = 128;
         int blocks  = (nkeep + threads - 1) / threads;
         spread_kernel_atom<<<blocks, threads>>>(
-            nkeep, nx, ny, nz, ax, ay, az,
+            nkeep, nx, ny, nz,
+            g11, g22, g33, g12, g13, g23,
+            schur33, rfx, rfy, rfz,
             d_xf, d_yf, d_zf,
             d_pre, d_wk, d_rcut2,
             d_rho
@@ -318,18 +384,23 @@ int spread_and_fft(
 
     cudaFree(d_pre); cudaFree(d_wk); cudaFree(d_rcut2);
 
-    // Copy map to host if requested
+    // Copy map to host if requested (convert double->float for visualisation)
     if (map_out != NULL) {
-        cudaMemcpy(map_out, d_rho, grid_size * sizeof(float), cudaMemcpyDeviceToHost);
+        float *d_rho_f;
+        cudaMalloc(&d_rho_f, grid_size * sizeof(float));
+        { int dt = 256, bt = (int)((grid_size + dt - 1) / dt);
+          double_to_float_kernel<<<bt, dt>>>(grid_size, d_rho, d_rho_f); }
+        cudaDeviceSynchronize();
+        cudaMemcpy(map_out, d_rho_f, grid_size * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_rho_f);
     }
 
     // FFT if output requested
     if (F_real != NULL || F_imag != NULL) {
-        // R2C FFT: input nx*ny*nz float32, output (nx/2+1)*ny*nz complex64
+        // D2Z FFT: input nx*ny*nz float64, output (nx/2+1)*ny*nz complex128
         // cuFFT convention: FFTW layout, nx*ny*nz real -> (nx/2+1)*ny*nz complex
-        // But gemmi uses FFTW with X as fastest index (Fortran/column-major)
         // Our grid is stored with X fastest (index = ix + nx*(iy+ny*iz))
-        // cuFFT r2c with n={nz,ny,nx} (slowest to fastest) should match this
+        // cuFFT d2z with n={nz,ny,nx} (slowest to fastest) matches this
 
         cufftHandle plan;
         int dims[3] = {nz, ny, nx};
@@ -337,7 +408,7 @@ int spread_and_fft(
             &plan, 3, dims,
             NULL, 1, 0,  // input: contiguous
             NULL, 1, 0,  // output: contiguous
-            CUFFT_R2C, 1
+            CUFFT_D2Z, 1
         );
         if (cr != CUFFT_SUCCESS) {
             fprintf(stderr, "ERROR cufftPlanMany: %d\n", cr);
@@ -345,11 +416,11 @@ int spread_and_fft(
         }
 
         size_t fft_out_size = (size_t)(nx/2+1) * ny * nz;
-        cufftComplex *d_Fc;
-        cudaMalloc(&d_Fc, fft_out_size * sizeof(cufftComplex));
+        cufftDoubleComplex *d_Fc;
+        cudaMalloc(&d_Fc, fft_out_size * sizeof(cufftDoubleComplex));
 
         cudaEventRecord(t0);
-        cr = cufftExecR2C(plan, d_rho, d_Fc);
+        cr = cufftExecD2Z(plan, d_rho, d_Fc);
         cudaEventRecord(t1);
         cudaDeviceSynchronize();
 
@@ -367,9 +438,9 @@ int spread_and_fft(
         // This avoids malloc'ing a large host h_Fc buffer whose pages would
         // cause first-access page faults inside cudaMemcpy (~1 µs/page).
         if (F_real != NULL && F_imag != NULL) {
-            float *d_Fr, *d_Fi;
-            cudaMalloc(&d_Fr, fft_out_size * sizeof(float));
-            cudaMalloc(&d_Fi, fft_out_size * sizeof(float));
+            double *d_Fr, *d_Fi;
+            cudaMalloc(&d_Fr, fft_out_size * sizeof(double));
+            cudaMalloc(&d_Fi, fft_out_size * sizeof(double));
 
             {
                 int dt = 256;
@@ -378,8 +449,8 @@ int spread_and_fft(
             }
 
             cudaDeviceSynchronize();
-            cudaMemcpy(F_real, d_Fr, fft_out_size * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(F_imag, d_Fi, fft_out_size * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(F_real, d_Fr, fft_out_size * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(F_imag, d_Fi, fft_out_size * sizeof(double), cudaMemcpyDeviceToHost);
             cudaFree(d_Fr);
             cudaFree(d_Fi);
         }

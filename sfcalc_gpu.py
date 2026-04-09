@@ -176,19 +176,16 @@ def b_threshold_for_level(L, pixel_fine, noise_frac):
     return fwhm_min ** 2 * (4.0 * math.pi ** 2) / ln2 - 8.0
 
 
-def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az, do_map=False):
+def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
+                alpha=90., beta=90., gamma=90., do_map=False):
     """Call the GPU spreading+FFT library.
     Returns (F_real_flat, F_imag_flat, map_buf_or_None, nkept).
     F_real/F_imag are float32, shape (nz*(ny*(nx//2+1)),), NOT yet normalised.
+    Cell angles in degrees; defaults to orthogonal (90,90,90).
     """
     nx2   = nx // 2 + 1
     fft_n = nx2 * ny * nz
 
-    # Use bytearray backing instead of np.zeros.  On Linux, np.zeros for large
-    # arrays uses mmap with lazy physical page allocation (calloc semantics),
-    # so the first write (cudaMemcpy) triggers ~1 µs/page faults (~1.6 s for
-    # 340 MB).  bytearray() pre-faults pages by actually writing zeros in the
-    # constructor, so cudaMemcpy runs at full PCIe bandwidth.
     _rbuf  = bytearray(fft_n * 4)
     _ibuf  = bytearray(fft_n * 4)
     F_real = np.frombuffer(_rbuf, dtype=np.float32)
@@ -211,6 +208,7 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az, do_map=False):
         el.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         nx, ny, nz,
         ctypes.c_float(ax), ctypes.c_float(ay), ctypes.c_float(az),
+        ctypes.c_float(alpha), ctypes.c_float(beta), ctypes.c_float(gamma),
         ctypes.c_float(0.0),          # bmax_skip disabled; Python pre-filters
         fptr(map_buf), fptr(F_real), fptr(F_imag),
     )
@@ -266,9 +264,6 @@ def main():
     ax, ay, az = cell.a, cell.b, cell.c
     print(f"  Cell: {ax:.3f} x {ay:.3f} x {az:.3f}  "
           f"angles: {cell.alpha:.2f} {cell.beta:.2f} {cell.gamma:.2f}")
-    if (abs(cell.alpha - 90) > 0.01 or abs(cell.beta  - 90) > 0.01
-                                     or abs(cell.gamma - 90) > 0.01):
-        sys.exit("ERROR: GPU kernel currently only supports orthogonal cells")
 
     xs, ys, zs, Bs, els = [], [], [], [], []
     for model in st:
@@ -307,7 +302,7 @@ def main():
 
     d0, nx, ny, nz = levels[0]
     nx2    = nx // 2 + 1
-    V_cell = ax * ay * az
+    V_cell = cell.volume
     w_px   = noise_wpx(noise)
 
     # Find last occupied level so we don't print a long tail of empty levels
@@ -341,8 +336,9 @@ def main():
         ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_int),
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_float, ctypes.c_float, ctypes.c_float,
-        ctypes.c_float,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,   # ax, ay, az
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,   # alpha, beta, gamma
+        ctypes.c_float,                                    # Bmax_skip
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
@@ -380,6 +376,7 @@ def main():
             x_arr[mask_L], y_arr[mask_L], z_arr[mask_L],
             B_arr[mask_L], el_arr[mask_L],
             nx_L, ny_L, nz_L, ax, ay, az,
+            cell.alpha, cell.beta, cell.gamma,
             do_map=(do_map and L == 0),
         )
         t1 = time.perf_counter()
@@ -421,14 +418,22 @@ def main():
     K_1d = np.where(K_1d > ny // 2, K_1d - ny, K_1d)
     L_1d = np.where(L_1d > nz // 2, L_1d - nz, L_1d)
 
-    inv_d2    = ((H_1d[None, None, :] / ax) ** 2 +
-                 (K_1d[None, :,  None] / ay) ** 2 +
-                 (L_1d[:,  None, None] / az) ** 2)
-    inv_dmin2 = 1.0 / (dmin * dmin)
-
     H3 = H_1d[None, None, :]
     K3 = K_1d[None, :,  None]
     L3 = L_1d[:,  None, None]
+
+    # Reciprocal metric tensor for general cell (reduces to (H/ax)^2+... for orthogonal)
+    rc = cell.reciprocal()
+    rca = math.cos(math.radians(rc.alpha))
+    rcb = math.cos(math.radians(rc.beta))
+    rcg = math.cos(math.radians(rc.gamma))
+    gs11 = rc.a**2;  gs22 = rc.b**2;  gs33 = rc.c**2
+    gs12 = rc.a * rc.b * rcg
+    gs13 = rc.a * rc.c * rcb
+    gs23 = rc.b * rc.c * rca
+    inv_d2 = (H3**2 * gs11 + K3**2 * gs22 + L3**2 * gs33
+              + 2*(H3*K3*gs12 + H3*L3*gs13 + K3*L3*gs23))
+    inv_dmin2 = 1.0 / (dmin * dmin)
 
     laue = sg.laue_str()
     if laue in ('-1',):

@@ -132,7 +132,7 @@ def assign_levels(B_arr, pixel_fine, noise_frac, n_levels):
     ln2   = math.log(2.0)
     log_f = math.log(LEVEL_FACTOR)
     w_px  = noise_wpx(noise_frac)
-    fwhm      = np.sqrt(ln2 * (B_arr + 8.0)) / (2.0 * math.pi)
+    fwhm      = np.sqrt(ln2 * (B_arr + 0.0)) / (2.0 * math.pi)
     pixel_req = fwhm / w_px
     ratio = pixel_req / pixel_fine
     lev = np.where(ratio >= 1.0,
@@ -148,7 +148,7 @@ def b_threshold_for_level(L, pixel_fine, noise_frac):
     w_px = noise_wpx(noise_frac)
     pixel_L  = pixel_fine * (LEVEL_FACTOR ** L)
     fwhm_min = pixel_L * w_px
-    return fwhm_min ** 2 * (4.0 * math.pi ** 2) / ln2 - 8.0
+    return fwhm_min ** 2 * (4.0 * math.pi ** 2) / ln2 - 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +159,10 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
                 alpha=90., beta=90., gamma=90., do_map=False):
     nx2   = nx // 2 + 1
     fft_n = nx2 * ny * nz
-    _rbuf  = bytearray(fft_n * 4)
-    _ibuf  = bytearray(fft_n * 4)
-    F_real = np.frombuffer(_rbuf, dtype=np.float32)
-    F_imag = np.frombuffer(_ibuf, dtype=np.float32)
+    _rbuf  = bytearray(fft_n * 8)
+    _ibuf  = bytearray(fft_n * 8)
+    F_real = np.frombuffer(_rbuf, dtype=np.float64)
+    F_imag = np.frombuffer(_ibuf, dtype=np.float64)
     if do_map:
         _mbuf   = bytearray(nx * ny * nz * 4)
         map_buf = np.frombuffer(_mbuf, dtype=np.float32)
@@ -174,6 +174,11 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
             return ctypes.cast(None, ctypes.POINTER(ctypes.c_float))
         return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
+    def dptr(arr):
+        if arr is None:
+            return ctypes.cast(None, ctypes.POINTER(ctypes.c_double))
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
     nkept = lib.spread_and_fft(
         len(x),
         fptr(x), fptr(y), fptr(z), fptr(B),
@@ -182,7 +187,7 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
         ctypes.c_float(ax), ctypes.c_float(ay), ctypes.c_float(az),
         ctypes.c_float(alpha), ctypes.c_float(beta), ctypes.c_float(gamma),
         ctypes.c_float(0.0),
-        fptr(map_buf), fptr(F_real), fptr(F_imag),
+        fptr(map_buf), dptr(F_real), dptr(F_imag),
     )
     if nkept < 0:
         sys.exit(f"ERROR: spread_and_fft returned {nkept}")
@@ -460,6 +465,16 @@ def main():
             a[keep] for a in (x_arr, y_arr, z_arr, B_arr, el_arr))
         natoms = int(keep.sum())
 
+    # Auto-blur: add b_add to all B-factors before spreading so no Gaussian is
+    # sub-pixel; the corresponding exp(-b_add*stol^2) envelope is corrected
+    # after the FFT by multiplying each F(H) by exp(+b_add*stol^2).
+    b_add = (dmin * rate) ** 2 / math.pi ** 2
+    sigma_min = math.sqrt(b_add / (4.0 * math.pi ** 2))
+    pixel_fine_pre = dmin / (2.0 * rate)
+    print(f"  Auto-blur: b_add = {b_add:.4f} A^2  "
+          f"(sigma_min = {sigma_min:.3f} A, pixel = {pixel_fine_pre:.3f} A)")
+    B_arr = B_arr + np.float32(b_add)
+
     # ------------------------------------------------------------------
     # 2. Multi-grid levels
     # ------------------------------------------------------------------
@@ -503,9 +518,9 @@ def main():
         ctypes.c_float, ctypes.c_float, ctypes.c_float,   # ax, ay, az
         ctypes.c_float, ctypes.c_float, ctypes.c_float,   # alpha, beta, gamma
         ctypes.c_float,                                    # Bmax_skip
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),   # map_out (float32)
+        ctypes.POINTER(ctypes.c_double),  # F_real  (float64)
+        ctypes.POINTER(ctypes.c_double),  # F_imag  (float64)
     ]
 
     # ------------------------------------------------------------------
@@ -513,10 +528,10 @@ def main():
     # ------------------------------------------------------------------
     do_map = bool(args['outmap'])
 
-    _acc_r = bytearray(nz * ny * nx2 * 4)
-    _acc_i = bytearray(nz * ny * nx2 * 4)
-    acc_real = np.frombuffer(_acc_r, dtype=np.float32).reshape(nz, ny, nx2)
-    acc_imag = np.frombuffer(_acc_i, dtype=np.float32).reshape(nz, ny, nx2)
+    _acc_r = bytearray(nz * ny * nx2 * 8)
+    _acc_i = bytearray(nz * ny * nx2 * 8)
+    acc_real = np.frombuffer(_acc_r, dtype=np.float64).reshape(nz, ny, nx2)
+    acc_imag = np.frombuffer(_acc_i, dtype=np.float64).reshape(nz, ny, nx2)
     map_buf  = None
     nkept_total = 0
 
@@ -554,6 +569,25 @@ def main():
         nkept_total += nk
     t_end = time.perf_counter()
     print(f"  GPU total: {(t_end-t_start)*1000:.0f} ms  ({nkept_total} atoms spread)")
+
+    # Apply blur correction: multiply every F(H) by exp(+b_add * stol^2)
+    # This undoes the exp(-b_add*stol^2) envelope introduced by the b_add offset.
+    H_c   = np.arange(nx2, dtype=np.float64)[None, None, :]
+    K_1dc = np.arange(ny,  dtype=np.float64)
+    L_1dc = np.arange(nz,  dtype=np.float64)
+    K_c = np.where(K_1dc > ny // 2, K_1dc - ny, K_1dc)[None, :, None]
+    L_c = np.where(L_1dc > nz // 2, L_1dc - nz, L_1dc)[:, None, None]
+    rc_s = cell.reciprocal()
+    cg = math.cos(math.radians(rc_s.gamma))
+    cb = math.cos(math.radians(rc_s.beta))
+    ca = math.cos(math.radians(rc_s.alpha))
+    stol2_g = 0.25 * (H_c**2 * rc_s.a**2 + K_c**2 * rc_s.b**2 + L_c**2 * rc_s.c**2
+                      + 2.0 * (H_c * K_c * rc_s.a * rc_s.b * cg
+                               + H_c * L_c * rc_s.a * rc_s.c * cb
+                               + K_c * L_c * rc_s.b * rc_s.c * ca))
+    blur_corr = np.exp(b_add * stol2_g)   # shape (nz, ny, nx2)
+    acc_real *= blur_corr
+    acc_imag *= blur_corr
 
     # ------------------------------------------------------------------
     # 5. Write CCP4 map if requested (level-0 atoms only when multi-grid)
