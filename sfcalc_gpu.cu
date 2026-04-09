@@ -161,7 +161,7 @@ __global__ void spread_kernel_atom(
     const float* __restrict__ pre_all,
     const float* __restrict__ wk_all,
     const float* __restrict__ rcut2_arr,
-    double* __restrict__ rho
+    float* __restrict__ rho
 )
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -203,7 +203,7 @@ __global__ void spread_kernel_atom(
                 float val = 0.f;
                 for (int k = 0; k < NG1; k++)
                     val += pre[k] * __expf(-wk[k] * r2);
-                atomicAdd(&rho[gx + nx * (gy + ny * gz)], (double)val);
+                atomicAdd(&rho[gx + nx * (gy + ny * gz)], val);
             }
         }
     }
@@ -215,18 +215,11 @@ __global__ void spread_kernel_atom(
 // cudaMemcpy write), by doing the split on the device then copying two
 // contiguous float arrays to pre-faulted host buffers.
 // ---------------------------------------------------------------------------
-__global__ void deinterleave_kernel(size_t n, const cufftDoubleComplex* __restrict__ src,
-                                    double* __restrict__ re, double* __restrict__ im)
+__global__ void deinterleave_kernel(size_t n, const cufftComplex* __restrict__ src,
+                                    float* __restrict__ re, float* __restrict__ im)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) { re[i] = src[i].x; im[i] = src[i].y; }
-}
-
-__global__ void double_to_float_kernel(size_t n, const double* __restrict__ src,
-                                        float* __restrict__ dst)
-{
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = (float)src[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +239,8 @@ int spread_and_fft(
     float alpha_deg, float beta_deg, float gamma_deg,  // cell angles in degrees
     float Bmax_skip,         // skip atoms with B > Bmax_skip (0 = keep all)
     float  *map_out,         // output real-space map nx*ny*nz float32 (may be NULL)
-    double *F_real,          // output Re(F), size (nx/2+1)*ny*nz float64 (may be NULL)
-    double *F_imag           // output Im(F), same size float64 (may be NULL)
+    float  *F_real,          // output Re(F), size (nx/2+1)*ny*nz float32 (may be NULL)
+    float  *F_imag           // output Im(F), same size float32 (may be NULL)
 )
 {
     // ----- Fractionalization matrix (general triclinic cell) -----
@@ -318,7 +311,7 @@ int spread_and_fft(
     // Allocate device memory
     size_t grid_size = (size_t)nx * ny * nz;
     float  *d_xf, *d_yf, *d_zf, *d_B;
-    double *d_rho;
+    float  *d_rho;
     int    *d_el;
 
     cudaMalloc(&d_xf,  nkeep * sizeof(float));
@@ -326,9 +319,9 @@ int spread_and_fft(
     cudaMalloc(&d_zf,  nkeep * sizeof(float));
     cudaMalloc(&d_B,   nkeep * sizeof(float));
     cudaMalloc(&d_el,  nkeep * sizeof(int));
-    cudaMalloc(&d_rho, grid_size * sizeof(double));
+    cudaMalloc(&d_rho, grid_size * sizeof(float));
 
-    cudaMemset(d_rho, 0, grid_size * sizeof(double));
+    cudaMemset(d_rho, 0, grid_size * sizeof(float));
 
     cudaMemcpy(d_xf, xf_all, nkeep * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_yf, yf_all, nkeep * sizeof(float), cudaMemcpyHostToDevice);
@@ -384,15 +377,9 @@ int spread_and_fft(
 
     cudaFree(d_pre); cudaFree(d_wk); cudaFree(d_rcut2);
 
-    // Copy map to host if requested (convert double->float for visualisation)
+    // Copy map to host if requested
     if (map_out != NULL) {
-        float *d_rho_f;
-        cudaMalloc(&d_rho_f, grid_size * sizeof(float));
-        { int dt = 256, bt = (int)((grid_size + dt - 1) / dt);
-          double_to_float_kernel<<<bt, dt>>>(grid_size, d_rho, d_rho_f); }
-        cudaDeviceSynchronize();
-        cudaMemcpy(map_out, d_rho_f, grid_size * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaFree(d_rho_f);
+        cudaMemcpy(map_out, d_rho, grid_size * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
     // FFT if output requested
@@ -408,7 +395,7 @@ int spread_and_fft(
             &plan, 3, dims,
             NULL, 1, 0,  // input: contiguous
             NULL, 1, 0,  // output: contiguous
-            CUFFT_D2Z, 1
+            CUFFT_R2C, 1
         );
         if (cr != CUFFT_SUCCESS) {
             fprintf(stderr, "ERROR cufftPlanMany: %d\n", cr);
@@ -416,11 +403,11 @@ int spread_and_fft(
         }
 
         size_t fft_out_size = (size_t)(nx/2+1) * ny * nz;
-        cufftDoubleComplex *d_Fc;
-        cudaMalloc(&d_Fc, fft_out_size * sizeof(cufftDoubleComplex));
+        cufftComplex *d_Fc;
+        cudaMalloc(&d_Fc, fft_out_size * sizeof(cufftComplex));
 
         cudaEventRecord(t0);
-        cr = cufftExecD2Z(plan, d_rho, d_Fc);
+        cr = cufftExecR2C(plan, d_rho, d_Fc);
         cudaEventRecord(t1);
         cudaDeviceSynchronize();
 
@@ -438,9 +425,9 @@ int spread_and_fft(
         // This avoids malloc'ing a large host h_Fc buffer whose pages would
         // cause first-access page faults inside cudaMemcpy (~1 µs/page).
         if (F_real != NULL && F_imag != NULL) {
-            double *d_Fr, *d_Fi;
-            cudaMalloc(&d_Fr, fft_out_size * sizeof(double));
-            cudaMalloc(&d_Fi, fft_out_size * sizeof(double));
+            float *d_Fr, *d_Fi;
+            cudaMalloc(&d_Fr, fft_out_size * sizeof(float));
+            cudaMalloc(&d_Fi, fft_out_size * sizeof(float));
 
             {
                 int dt = 256;
@@ -449,14 +436,15 @@ int spread_and_fft(
             }
 
             cudaDeviceSynchronize();
-            cudaMemcpy(F_real, d_Fr, fft_out_size * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(F_imag, d_Fi, fft_out_size * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(F_real, d_Fr, fft_out_size * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(F_imag, d_Fi, fft_out_size * sizeof(float), cudaMemcpyDeviceToHost);
             cudaFree(d_Fr);
             cudaFree(d_Fi);
         }
 
         cudaFree(d_Fc);
         cufftDestroy(plan);
+
     }
 
     cudaFree(d_xf); cudaFree(d_yf); cudaFree(d_zf);

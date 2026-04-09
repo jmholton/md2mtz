@@ -159,10 +159,10 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
                 alpha=90., beta=90., gamma=90., do_map=False):
     nx2   = nx // 2 + 1
     fft_n = nx2 * ny * nz
-    _rbuf  = bytearray(fft_n * 8)
-    _ibuf  = bytearray(fft_n * 8)
-    F_real = np.frombuffer(_rbuf, dtype=np.float64)
-    F_imag = np.frombuffer(_ibuf, dtype=np.float64)
+    _rbuf  = bytearray(fft_n * 4)
+    _ibuf  = bytearray(fft_n * 4)
+    F_real = np.frombuffer(_rbuf, dtype=np.float32)
+    F_imag = np.frombuffer(_ibuf, dtype=np.float32)
     if do_map:
         _mbuf   = bytearray(nx * ny * nz * 4)
         map_buf = np.frombuffer(_mbuf, dtype=np.float32)
@@ -174,11 +174,6 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
             return ctypes.cast(None, ctypes.POINTER(ctypes.c_float))
         return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-    def dptr(arr):
-        if arr is None:
-            return ctypes.cast(None, ctypes.POINTER(ctypes.c_double))
-        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-
     nkept = lib.spread_and_fft(
         len(x),
         fptr(x), fptr(y), fptr(z), fptr(B),
@@ -187,7 +182,7 @@ def run_gpu_raw(lib, x, y, z, B, el, nx, ny, nz, ax, ay, az,
         ctypes.c_float(ax), ctypes.c_float(ay), ctypes.c_float(az),
         ctypes.c_float(alpha), ctypes.c_float(beta), ctypes.c_float(gamma),
         ctypes.c_float(0.0),
-        fptr(map_buf), dptr(F_real), dptr(F_imag),
+        fptr(map_buf), fptr(F_real), fptr(F_imag),
     )
     if nkept < 0:
         sys.exit(f"ERROR: spread_and_fft returned {nkept}")
@@ -519,8 +514,8 @@ def main():
         ctypes.c_float, ctypes.c_float, ctypes.c_float,   # alpha, beta, gamma
         ctypes.c_float,                                    # Bmax_skip
         ctypes.POINTER(ctypes.c_float),   # map_out (float32)
-        ctypes.POINTER(ctypes.c_double),  # F_real  (float64)
-        ctypes.POINTER(ctypes.c_double),  # F_imag  (float64)
+        ctypes.POINTER(ctypes.c_float),   # F_real  (float32)
+        ctypes.POINTER(ctypes.c_float),   # F_imag  (float32)
     ]
 
     # ------------------------------------------------------------------
