@@ -123,6 +123,28 @@ Validated against gemmi's direct-sum structure factor calculator on a 1000-atom,
 
 Errors at weak reflections are dominated by near-zero denominators, not systematic bias. All 230 space groups pass an independent collapse test vs `gemmi sfcalc` (mean <0.5%, max <5%).
 
+### Accuracy vs phenix.fmodel
+
+`phenix.fmodel` was run on the same 1000-atom P1 cell and its output compared against the same gemmi direct-sum reference, for two B-factor distributions:
+
+**Uniform B = 20 Å²** (all atoms identical):
+
+| F bin | N | phenix mean | GPU mean |
+|-------|---|-------------|----------|
+| F ≥ 100 | 114 041 | 0.53% | **0.03%** |
+| [10, 100) | 964 757 | 1.23% | 0.13% |
+| [1, 10) | 80 458 | 6.4% | 1.0% |
+
+**Random B = 2–998 Å²**:
+
+| F bin | N | phenix mean | GPU mean |
+|-------|---|-------------|----------|
+| F ≥ 100 | 8 860 | 0.24% | **0.03%** |
+| [10, 100) | 580 297 | 0.46% | 0.13% |
+| [1, 10) | 561 304 | 1.29% | 1.0% |
+
+phenix is ~17× less accurate than this code for strong reflections. Notably, phenix accuracy is *better* for the random-B structure than for uniform B=20 — the opposite of what a high-B cutoff radius problem would produce. The most likely cause is a mismatch in auto-blur (`b_add`) or grid rate between phenix and gemmi: at uniform B=20 all atoms have narrow Gaussians near the pixel scale, amplifying any difference in aliasing correction. High-B atoms (broad Gaussians, well-sampled on the grid) reduce the discrepancy.
+
 ### Aliasing correction
 
 The IT92 form factors include a constant term `c` (effective `b = 0`) that would be sub-pixel at low B-factors, causing ~0.7% aliasing error per Å² of B. The code applies **auto-blur** (identical to gemmi's approach): a correction `b_add = (dmin·rate)²/π²` is added to every atom's B-factor before spreading, and the resulting `exp(−b_add·stol²)` envelope is divided out of each F(H) after the FFT. At `dmin=2.0`, `rate=2.5`: `b_add = 2.53 Å²`, `σ_min = 0.25 Å` (pixel = 0.40 Å).
