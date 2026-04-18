@@ -143,7 +143,20 @@ Errors at weak reflections are dominated by near-zero denominators, not systemat
 | [10, 100) | 580 297 | 0.46% | 0.13% |
 | [1, 10) | 561 304 | 1.29% | 1.0% |
 
-phenix is ~17× less accurate than this code for strong reflections. Notably, phenix accuracy is *better* for the random-B structure than for uniform B=20 — the opposite of what a high-B cutoff radius problem would produce. The most likely cause is a mismatch in auto-blur (`b_add`) or grid rate between phenix and gemmi: at uniform B=20 all atoms have narrow Gaussians near the pixel scale, amplifying any difference in aliasing correction. High-B atoms (broad Gaussians, well-sampled on the grid) reduce the discrepancy.
+phenix is ~17× less accurate than this code for strong reflections. Notably, phenix accuracy is *better* for the random-B structure than for uniform B=20 — the opposite of what a high-B cutoff radius problem would produce.
+
+**Root cause: phenix uses a 2.25× coarser FFT grid.**
+
+| | phenix.fmodel | this code |
+|--|---------------|-----------|
+| Grid (170 Å cell, dmin=2.0) | 256×256×240 | 576×576×512 |
+| Pixel size | 0.665 Å | 0.296 Å |
+| b_add (auto-blur) | 0.91 Å² | 2.53 Å² |
+| σ/pixel for narrowest C Gaussian (B=10) | **0.55** (sub-pixel) | **1.37** (above pixel) |
+
+Phenix's `grid_resolution_factor=1/3` sets the pixel to dmin/3 = 0.667 Å. This code uses `rate=2.5`, which sets the pixel to dmin/5 = 0.40 Å (576 is the next FFT-friendly grid size, giving 0.30 Å actual pixel). The narrowest IT92 Gaussian for a carbon atom (b₃=0.57 Å²) at B=10 has σ=0.37 Å, which is sub-pixel on phenix's grid even after the auto-blur correction (b_add=0.91 Å²). Sub-pixel Gaussians alias regardless of b_add. This code's finer grid keeps all Gaussians above the pixel size after auto-blur (σ_eff/pixel ≥ 1.37).
+
+Switching phenix to `scattering_table=it1992` (matching gemmi's form factors) reduced the F≥100 error only from 0.53% to 0.36%, confirming that form factor choice is a minor contributor. The dominant cause is the coarser grid.
 
 ### Aliasing correction
 
