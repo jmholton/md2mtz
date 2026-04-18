@@ -37,10 +37,9 @@ endif
 
 echo "Compiling sfcalc_gpu_collapse.cpp ..."
 /opt/rh/devtoolset-7/root/usr/bin/g++ -O2 -std=c++14 \
-    -I/programs/ccp4-8.0/include \
-    -L. -Wl,-rpath,'$ORIGIN' \
+    -I./include \
     sfcalc_gpu_collapse.cpp \
-    -lsfcalc_gpu -ldl -lm \
+    -ldl -lm \
     -o sfcalc_gpu_collapse
 
 if ( $status == 0 ) then

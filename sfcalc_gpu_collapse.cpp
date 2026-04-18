@@ -2,6 +2,8 @@
  * sfcalc_gpu_collapse.cpp
  * =======================
  * C++ port of sfcalc_gpu_collapse.py — same algorithm, no Python overhead.
+ * No CCP4 runtime dependency: uses vendored gemmi/symmetry.hpp (header-only,
+ * MPL 2.0) for space-group tables; PDB reading and MTZ writing are hand-rolled.
  *
  * Usage: same command-line interface as the Python script.
  *   ./sfcalc_gpu_collapse  input.pdb  [dmin=1.5]  [rate=2.5]  [sg=P1]
@@ -17,12 +19,12 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstdarg>
 #include <dlfcn.h>
 
-#include <gemmi/model.hpp>
-#include <gemmi/mmread.hpp>
-#include <gemmi/symmetry.hpp>
-#include <gemmi/mtz.hpp>
+// Vendored gemmi headers (header-only, MPL 2.0, no libgemmi_cpp needed).
+// Only symmetry.hpp + fail.hpp are needed; everything else is hand-rolled.
+#include "include/gemmi/symmetry.hpp"
 
 // ---------------------------------------------------------------------------
 // GPU library function (extern "C" in sfcalc_gpu.cu)
@@ -38,9 +40,280 @@ typedef int (*SpreadAndFft_fn)(
 );
 
 // ---------------------------------------------------------------------------
+// Minimal UnitCell (replaces gemmi::UnitCell)
+// ---------------------------------------------------------------------------
+struct UnitCell {
+    double a, b, c;
+    double alpha, beta, gamma;  // degrees
+
+    double volume() const {
+        double ca = cos(alpha * M_PI/180.0);
+        double cb = cos(beta  * M_PI/180.0);
+        double cg = cos(gamma * M_PI/180.0);
+        return a*b*c * sqrt(1.0 - ca*ca - cb*cb - cg*cg + 2.0*ca*cb*cg);
+    }
+
+    // Returns the reciprocal-space unit cell (a*, b*, c*, alpha*, beta*, gamma*)
+    UnitCell reciprocal() const {
+        double ca = cos(alpha * M_PI/180.0), sa = sin(alpha * M_PI/180.0);
+        double cb = cos(beta  * M_PI/180.0), sb = sin(beta  * M_PI/180.0);
+        double cg = cos(gamma * M_PI/180.0), sg = sin(gamma * M_PI/180.0);
+        double V = volume();
+        UnitCell r;
+        r.a = b*c*sa / V;
+        r.b = a*c*sb / V;
+        r.c = a*b*sg / V;
+        // cos(alpha*) = (cos(beta)*cos(gamma) - cos(alpha)) / (sin(beta)*sin(gamma))
+        r.alpha = acos((cb*cg - ca) / (sb*sg)) * 180.0/M_PI;
+        r.beta  = acos((ca*cg - cb) / (sa*sg)) * 180.0/M_PI;
+        r.gamma = acos((ca*cb - cg) / (sa*sb)) * 180.0/M_PI;
+        return r;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Minimal PDB parser (replaces gemmi::read_structure_file)
+// Reads CRYST1 for cell parameters; ATOM/HETATM for atoms.
+// Element is taken from cols 77-78 if present, else derived from atom name.
+// ---------------------------------------------------------------------------
+static int elem_idx(const char* sym) {
+    // skip leading spaces
+    while (*sym == ' ') sym++;
+    if (sym[0]=='C' && sym[1]!='L' && sym[1]!='A' && sym[1]!='O' &&
+        sym[1]!='R' && sym[1]!='S' && sym[1]!='U' && sym[1]!='D' &&
+        sym[1]!='E' && sym[1]!='F' && sym[1]!='N' && sym[1]!='l' &&
+        (sym[1]==' '||sym[1]=='\0'||sym[1]>='a'))   return 0; // C
+    if (sym[0]=='H') return 1;  // H (also covers HG etc. — default C below)
+    if (sym[0]=='N') return 2;  // N
+    if (sym[0]=='O') return 3;  // O
+    if (sym[0]=='P') return 4;  // P
+    if (sym[0]=='S') return 5;  // S
+    return 0;  // default C
+}
+
+// Safe column extraction (0-indexed start, length) into null-terminated buf
+static void pdb_col(const char* line, int start, int len, char* buf) {
+    int llen = (int)strlen(line);
+    for (int i = 0; i < len; i++)
+        buf[i] = (start+i < llen) ? line[start+i] : ' ';
+    buf[len] = '\0';
+}
+
+static bool read_pdb(const char* path,
+                     UnitCell& cell,
+                     std::vector<float>& xs, std::vector<float>& ys,
+                     std::vector<float>& zs, std::vector<float>& Bs,
+                     std::vector<int>& els)
+{
+    FILE* f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "ERROR: cannot open %s\n", path); return false; }
+
+    bool got_cryst1 = false;
+    char line[256];
+    char buf[32];
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "CRYST1", 6) == 0) {
+            // a:7-15, b:16-24, c:25-33, alpha:34-40, beta:41-47, gamma:48-54
+            pdb_col(line, 6, 9, buf);  cell.a     = atof(buf);
+            pdb_col(line, 15, 9, buf); cell.b     = atof(buf);
+            pdb_col(line, 24, 9, buf); cell.c     = atof(buf);
+            pdb_col(line, 33, 7, buf); cell.alpha = atof(buf);
+            pdb_col(line, 40, 7, buf); cell.beta  = atof(buf);
+            pdb_col(line, 47, 7, buf); cell.gamma = atof(buf);
+            got_cryst1 = true;
+            continue;
+        }
+        if (strncmp(line, "ATOM  ", 6) != 0 && strncmp(line, "HETATM", 6) != 0)
+            continue;
+
+        pdb_col(line, 30, 8, buf); float x = (float)atof(buf);
+        pdb_col(line, 38, 8, buf); float y = (float)atof(buf);
+        pdb_col(line, 46, 8, buf); float z = (float)atof(buf);
+        pdb_col(line, 60, 6, buf); float B = (float)atof(buf);
+
+        // Element: cols 77-78 (0-indexed 76-77); fall back to atom name cols 12-13
+        pdb_col(line, 76, 2, buf);
+        int el;
+        if (buf[0] != ' ' || buf[1] != ' ') {
+            el = elem_idx(buf);
+        } else {
+            pdb_col(line, 12, 2, buf);
+            // atom name: first char may be space for 1-char elements
+            el = elem_idx(buf);
+        }
+
+        xs.push_back(x); ys.push_back(y); zs.push_back(z);
+        Bs.push_back(B); els.push_back(el);
+    }
+    fclose(f);
+    if (!got_cryst1) { fprintf(stderr, "ERROR: no CRYST1 in %s\n", path); return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal MTZ binary writer (replaces gemmi::Mtz)
+// Writes a minimal but CCP4-compatible MTZ file.
+// ---------------------------------------------------------------------------
+
+// Write an 80-character header record (space-padded).
+static void mtz_rec(FILE* f, const char* fmt, ...) {
+    char buf[81] = {};
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    // pad to 80 with spaces
+    int n = (int)strlen(buf);
+    memset(buf + n, ' ', 80 - n);
+    fwrite(buf, 1, 80, f);
+}
+
+static void write_mtz(const char* path,
+                       const UnitCell& cell,
+                       const gemmi::SpaceGroup* sg,
+                       int ncol,
+                       const char* const col_names[],   // ncol names
+                       const char  col_types[],          // ncol type chars
+                       const char* const col_datasets[], // ncol dataset names
+                       int nrefl,
+                       const float* data)               // nrefl * ncol floats
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "ERROR: cannot write %s\n", path); return; }
+
+    // Machine stamp: little-endian IEEE (same as CCP4 on x86)
+    static const unsigned char stamp[4] = { 0x44, 0x41, 0x00, 0x00 };
+    // Header location (1-indexed word count from start of file)
+    int header_loc = 4 + nrefl * ncol;  // 3 pre-data words + data words
+
+    // Write pre-data: MTZ magic, header location, machine stamp
+    fwrite("MTZ ", 1, 4, f);
+    fwrite(&header_loc, 4, 1, f);
+    fwrite(stamp, 4, 1, f);
+
+    // Write data
+    fwrite(data, sizeof(float), (size_t)nrefl * ncol, f);
+
+    // ------- Text header (80-char records) -------
+
+    mtz_rec(f, "VERS MTZ:V1.1");
+    mtz_rec(f, "TITLE sfcalc_gpu_collapse output");
+    mtz_rec(f, "NCOL %8d %12d %8d", ncol, nrefl, 0);
+    mtz_rec(f, "CELL  %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f",
+            cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+    mtz_rec(f, "SORT    0    0    0    0    0");
+
+    // SYMINF: nsym nsymp lattice spgno 'spgname'
+    gemmi::GroupOps ops = sg->operations();
+    int nsym  = (int)ops.order();
+    int nsymp = (int)ops.sym_ops.size();
+    char lattice = sg->hm[0];
+    mtz_rec(f, "SYMINF %4d %4d %c %4d '%s'",
+            nsym, nsymp, lattice, sg->number, sg->xhm());
+
+    // SYMM records: all operators (sym_ops × cen_ops)
+    for (const gemmi::Op& s : ops.sym_ops)
+        for (const gemmi::Op::Tran& c : ops.cen_ops) {
+            gemmi::Op combined = s;
+            for (int i = 0; i < 3; i++)
+                combined.tran[i] = ((s.tran[i] + c[i]) % gemmi::Op::DEN
+                                    + gemmi::Op::DEN) % gemmi::Op::DEN;
+            mtz_rec(f, "SYMM %s", combined.triplet().c_str());
+        }
+
+    // Resolution limits
+    UnitCell rc = cell.reciprocal();
+    double ca = cos(rc.alpha*M_PI/180), cb = cos(rc.beta*M_PI/180), cg = cos(rc.gamma*M_PI/180);
+    double max_invd2 = 0.0;
+    for (int i = 0; i < nrefl; i++) {
+        double H = data[i*ncol+0], K = data[i*ncol+1], L = data[i*ncol+2];
+        double invd2 = H*H*rc.a*rc.a + K*K*rc.b*rc.b + L*L*rc.c*rc.c
+                     + 2.0*(H*K*rc.a*rc.b*cg + H*L*rc.a*rc.c*cb + K*L*rc.b*rc.c*ca);
+        if (invd2 > max_invd2) max_invd2 = invd2;
+    }
+    mtz_rec(f, "RESO  %12.6f %12.6f", 0.0, max_invd2);
+    mtz_rec(f, "VALM NaN");
+
+    // Column min/max
+    std::vector<float> cmin(ncol,  1e30f);
+    std::vector<float> cmax(ncol, -1e30f);
+    for (int i = 0; i < nrefl; i++)
+        for (int c = 0; c < ncol; c++) {
+            float v = data[i*ncol+c];
+            if (v < cmin[c]) cmin[c] = v;
+            if (v > cmax[c]) cmax[c] = v;
+        }
+
+    // Two datasets: HKL_base (id 1) and SFCALC_GPU (id 2)
+    for (int c = 0; c < ncol; c++)
+        mtz_rec(f, "COL %-30s %c %12.4f %12.4f %s",
+                col_names[c], col_types[c], cmin[c], cmax[c], col_datasets[c]);
+
+    mtz_rec(f, "DCELL  1 %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f",
+            cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+    mtz_rec(f, "DWAVEL  1 %10.4f", 0.0);
+    mtz_rec(f, "DCELL  2 %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f",
+            cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma);
+    mtz_rec(f, "DWAVEL  2 %10.4f", 1.0);
+    mtz_rec(f, "PROJECT  1 DEFAULT");
+    mtz_rec(f, "CRYSTAL  1 DEFAULT");
+    mtz_rec(f, "DATASET  1 HKL_base");
+    mtz_rec(f, "PROJECT  2 DEFAULT");
+    mtz_rec(f, "CRYSTAL  2 DEFAULT");
+    mtz_rec(f, "DATASET  2 SFCALC_GPU");
+    mtz_rec(f, "BATCH");
+    mtz_rec(f, "END");
+
+    fclose(f);
+    fprintf(stderr, "  Written: %s  (%d reflections)\n", path, nrefl);
+}
+
+// Convenience wrappers matching the old API
+static void write_mtz_phased(const std::vector<int>& h, const std::vector<int>& k,
+                               const std::vector<int>& l,
+                               const std::vector<float>& amp, const std::vector<float>& phi,
+                               const UnitCell& cell, const gemmi::SpaceGroup* sg,
+                               const std::string& path) {
+    int n = (int)h.size();
+    std::vector<float> data(5*n);
+    for (int i = 0; i < n; i++) {
+        data[5*i+0] = (float)h[i];
+        data[5*i+1] = (float)k[i];
+        data[5*i+2] = (float)l[i];
+        data[5*i+3] = amp[i];
+        data[5*i+4] = phi[i];
+    }
+    static const char* names[] = {"H","K","L","FC","PHIC"};
+    static const char  types[] = {'H','H','H','F','P'};
+    static const char* dsets[] = {"HKL_base","HKL_base","HKL_base","SFCALC_GPU","SFCALC_GPU"};
+    write_mtz(path.c_str(), cell, sg, 5, names, types, dsets, n, data.data());
+}
+
+static void write_mtz_intensity(const std::vector<int>& h, const std::vector<int>& k,
+                                 const std::vector<int>& l,
+                                 const std::vector<float>& intensity,
+                                 const UnitCell& cell,
+                                 const std::string& path) {
+    const gemmi::SpaceGroup* sg_p1 = gemmi::find_spacegroup_by_name("P 1");
+    int n = (int)h.size();
+    std::vector<float> data(4*n);
+    for (int i = 0; i < n; i++) {
+        data[4*i+0] = (float)h[i];
+        data[4*i+1] = (float)k[i];
+        data[4*i+2] = (float)l[i];
+        data[4*i+3] = intensity[i];
+    }
+    static const char* names[] = {"H","K","L","I"};
+    static const char  types[] = {'H','H','H','J'};
+    static const char* dsets[] = {"HKL_base","HKL_base","HKL_base","SFCALC_GPU"};
+    write_mtz(path.c_str(), cell, sg_p1, 4, names, types, dsets, n, data.data());
+}
+
+// ---------------------------------------------------------------------------
 // Element index (must match order in sfcalc_gpu.cu)
 // ---------------------------------------------------------------------------
-static int elem_idx(const std::string& name) {
+static int elem_idx_from_name(const std::string& name) {
     if (name == "C") return 0;
     if (name == "H") return 1;
     if (name == "N") return 2;
@@ -119,8 +392,6 @@ static double b_threshold_for_level(int L, double pixel_fine, double noise_frac)
 
 // ---------------------------------------------------------------------------
 // Accumulate coarse FFT output into fine-grid arrays (frequency-domain insert)
-// Matches the Python add_to_fine logic exactly.
-// acc is [nz][ny][nx2], coarse is [nz_c][ny_c][nx_c2], both row-major.
 // ---------------------------------------------------------------------------
 static void add_to_fine(float* acc_re, float* acc_im,
                          int nx, int ny, int nz,
@@ -209,14 +480,13 @@ static void apply_blur(float* acc_re, float* acc_im,
 struct HKL { int h, k, l; };
 
 static std::vector<HKL> build_prim_asu(const gemmi::SpaceGroup* sg,
-                                        const gemmi::UnitCell& cell,
+                                        const UnitCell& cell,
                                         double dmin) {
-    gemmi::UnitCell rc = cell.reciprocal();
+    UnitCell rc = cell.reciprocal();
     int H_max = (int)ceil(1.0 / (dmin * rc.a));
     int K_max = (int)ceil(1.0 / (dmin * rc.b));
     int L_max = (int)ceil(1.0 / (dmin * rc.c));
 
-    // Reciprocal metric tensor for general cell
     double rca = cos(rc.alpha * M_PI / 180.0);
     double rcb = cos(rc.beta  * M_PI / 180.0);
     double rcg = cos(rc.gamma * M_PI / 180.0);
@@ -268,14 +538,13 @@ static void collapse_to_prim_asu(const float* acc_re, const float* acc_im,
         for (int i = 0; i < n; i++) {
             int H = asu[i].h, K = asu[i].k, L = asu[i].l;
 
-            // R^T * (H,K,L) — column-major (transposed) indexing
+            // R^T * (H,K,L)
             int Hr = (rot[0][0]*H + rot[1][0]*K + rot[2][0]*L) / den;
             int Kr = (rot[0][1]*H + rot[1][1]*K + rot[2][1]*L) / den;
             int Lr = (rot[0][2]*H + rot[1][2]*K + rot[2][2]*L) / den;
 
             int SH = na * Hr, SK = nb * Kr, SL = nc * Lr;
 
-            // Friedel mate if in H<0 half-space
             bool friedel = (SH < 0) || (SH == 0 && SK < 0)
                          || (SH == 0 && SK == 0 && SL < 0);
             if (friedel) { SH = -SH; SK = -SK; SL = -SL; }
@@ -290,7 +559,6 @@ static void collapse_to_prim_asu(const float* acc_re, const float* acc_im,
             float re   =  acc_re[idx];
             float im   = friedel ? -acc_im[idx] : acc_im[idx];
 
-            // Phase factor: exp(2πi H·t)
             float phase = (float)(2.0 * M_PI *
                           (H * tran[0] + K * tran[1] + L * tran[2]) / (double)den);
             float cp = cosf(phase), sp = sinf(phase);
@@ -299,73 +567,6 @@ static void collapse_to_prim_asu(const float* acc_re, const float* acc_im,
             F_im[i] += re * sp + im * cp;
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Write MTZ (FC + PHIC)
-// ---------------------------------------------------------------------------
-static void write_mtz(const std::vector<HKL>& hkl,
-                       const std::vector<float>& amp,
-                       const std::vector<float>& phi,
-                       const gemmi::UnitCell& cell,
-                       const gemmi::SpaceGroup* sg,
-                       const std::string& path) {
-    int n = (int)hkl.size();
-    gemmi::Mtz mtz(false);
-    mtz.spacegroup = sg;
-    mtz.cell = cell;
-    auto& hkl_ds  = mtz.add_dataset("HKL_base");   hkl_ds.wavelength  = 0.0;
-    auto& data_ds = mtz.add_dataset("SFCALC_GPU");  data_ds.wavelength = 1.0;
-    int ds_id = data_ds.id;
-    mtz.add_column("H",    'H', 0,     -1, false);
-    mtz.add_column("K",    'H', 0,     -1, false);
-    mtz.add_column("L",    'H', 0,     -1, false);
-    mtz.add_column("FC",   'F', ds_id, -1, false);
-    mtz.add_column("PHIC", 'P', ds_id, -1, false);
-
-    std::vector<float> data(5 * n);
-    for (int i = 0; i < n; i++) {
-        data[5*i+0] = (float)hkl[i].h;
-        data[5*i+1] = (float)hkl[i].k;
-        data[5*i+2] = (float)hkl[i].l;
-        data[5*i+3] = amp[i];
-        data[5*i+4] = phi[i];
-    }
-    mtz.set_data(data.data(), 5 * n);
-    mtz.write_to_file(path);
-    fprintf(stderr, "  Written: %s  (%d reflections)\n", path.c_str(), n);
-}
-
-// ---------------------------------------------------------------------------
-// Write intensity MTZ (I = |F|^2, P1 space)
-// ---------------------------------------------------------------------------
-static void write_mtz_I(const std::vector<HKL>& hkl,
-                         const std::vector<float>& intensity,
-                         const gemmi::UnitCell& cell,
-                         const std::string& path) {
-    int n = (int)hkl.size();
-    const gemmi::SpaceGroup* sg_p1 = gemmi::find_spacegroup_by_name("P 1");
-    gemmi::Mtz mtz(false);
-    mtz.spacegroup = sg_p1;
-    mtz.cell = cell;
-    auto& hkl_ds  = mtz.add_dataset("HKL_base");   hkl_ds.wavelength  = 0.0;
-    auto& data_ds = mtz.add_dataset("SFCALC_GPU");  data_ds.wavelength = 1.0;
-    int ds_id = data_ds.id;
-    mtz.add_column("H", 'H', 0,     -1, false);
-    mtz.add_column("K", 'H', 0,     -1, false);
-    mtz.add_column("L", 'H', 0,     -1, false);
-    mtz.add_column("I", 'J', ds_id, -1, false);
-
-    std::vector<float> data(4 * n);
-    for (int i = 0; i < n; i++) {
-        data[4*i+0] = (float)hkl[i].h;
-        data[4*i+1] = (float)hkl[i].k;
-        data[4*i+2] = (float)hkl[i].l;
-        data[4*i+3] = intensity[i];
-    }
-    mtz.set_data(data.data(), 4 * n);
-    mtz.write_to_file(path);
-    fprintf(stderr, "  Written: %s  (%d reflections)\n", path.c_str(), n);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +579,6 @@ struct Args {
 };
 
 static Args parse_args(int argc, char** argv) {
-    // Compute default lib path: same directory as this executable
     std::string exe(argv[0]);
     std::string dir = exe.substr(0, exe.rfind('/') + 1);
 
@@ -396,9 +596,49 @@ static Args parse_args(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
+        if (arg == "--help" || arg == "-h" || arg == "-help") {
+            printf(
+"Usage: sfcalc_gpu_collapse <input.pdb> [key=value ...]\n"
+"\n"
+"Compute crystallographic structure factors from a P1 supercell PDB using GPU\n"
+"FFT, then collapse to the primitive-cell ASU using space-group symmetry.\n"
+"\n"
+"Required:\n"
+"  <input.pdb>          P1 supercell PDB with CRYST1 giving supercell dimensions\n"
+"\n"
+"Options (key=value, case-insensitive):\n"
+"  sg=<name>            Space group of the PRIMITIVE cell  (default: P 1)\n"
+"                         e.g. sg=\"P 21 21 21\"  sg=\"I 2 3\"  sg=19\n"
+"  super_mult=na,nb,nc  Supercell multipliers along a, b, c  (default: 1,1,1)\n"
+"                         Primitive cell = supercell / (na, nb, nc)\n"
+"  dmin=<A>             Resolution limit in Angstroms  (default: 1.5)\n"
+"  rate=<r>             Shannon oversampling rate for FFT grid  (default: 2.5)\n"
+"  bmax=<B>             Skip atoms with B-factor > bmax; 0 = keep all  (default: 0)\n"
+"  noise=<f>            Multi-grid B-factor coarsening tolerance  (default: 0.01)\n"
+"                         Fraction of peak density; higher = coarser/faster\n"
+"\n"
+"Output files:\n"
+"  outmtz=<file>        Primitive-cell ASU MTZ with FC and PHIC  (default: collapsed.mtz)\n"
+"                         Use for computing |<F>|^2 by averaging complex F across frames\n"
+"  outI=<file>          Supercell P1 intensity MTZ with I=|F|^2  (default: supercell_I.mtz)\n"
+"                         Use for computing <|F|^2> by averaging I across frames\n"
+"  outmap=<file>        Electron density map in CCP4 format (optional, default: none)\n"
+"\n"
+"Advanced:\n"
+"  lib=<path>           Path to sfcalc_gpu.so  (default: directory of this executable)\n"
+"\n"
+"Diffuse scatter intensity: I_diffuse(H) = <|F(H)|^2> - |<F(H)>|^2\n"
+"  Average outI across MD frames to get <|F|^2>.\n"
+"  Average complex F from outmtz across frames, then square, to get |<F>|^2.\n"
+"\n"
+"Example (orthorhombic 2x2x2 supercell):\n"
+"  sfcalc_gpu_collapse frame_001.pdb sg=\"P 21 21 21\" super_mult=2,2,2 dmin=2.0\n"
+"      outmtz=frame_001_collapsed.mtz outI=frame_001_I.mtz\n"
+);
+            exit(0);
+        }
         auto eq = arg.find('=');
         if (eq == std::string::npos) {
-            // positional: PDB file
             if (arg.size() > 4 &&
                 (arg.substr(arg.size()-4) == ".pdb" ||
                  arg.substr(arg.size()-4) == ".cif"))
@@ -407,7 +647,6 @@ static Args parse_args(int argc, char** argv) {
         }
         std::string key = arg.substr(0, eq);
         std::string val = arg.substr(eq+1);
-        // lowercase key
         for (auto& c : key) c = tolower(c);
 
         if (key == "dmin")            a.dmin   = atof(val.c_str());
@@ -421,7 +660,6 @@ static Args parse_args(int argc, char** argv) {
         else if (key == "sg" || key == "spacegroup" || key == "space_group")
             a.sg_name = val;
         else if (key == "super_mult" || key == "mult" || key == "multipliers") {
-            // parse na,nb,nc  (comma or x separated)
             std::string v = val;
             for (auto& c : v) if (c == 'x') c = ',';
             if (sscanf(v.c_str(), "%d,%d,%d", &a.na, &a.nb, &a.nc) != 3) {
@@ -440,6 +678,7 @@ int main(int argc, char** argv) {
     Args args = parse_args(argc, argv);
     if (args.pdb.empty()) {
         fprintf(stderr, "Usage: sfcalc_gpu_collapse <input.pdb> [key=val ...]\n");
+        fprintf(stderr, "Run with --help for full option list.\n");
         return 1;
     }
 
@@ -449,7 +688,6 @@ int main(int argc, char** argv) {
     double noise = args.noise;
     int na = args.na, nb = args.nb, nc = args.nc;
 
-    // Resolve space group
     const gemmi::SpaceGroup* sg = gemmi::find_spacegroup_by_name(args.sg_name);
     if (!sg) { fprintf(stderr, "ERROR: unknown space group '%s'\n", args.sg_name.c_str()); return 1; }
 
@@ -457,32 +695,20 @@ int main(int argc, char** argv) {
     // 1. Load PDB
     // -----------------------------------------------------------------------
     fprintf(stderr, "Reading %s ...\n", args.pdb.c_str());
-    gemmi::Structure st = gemmi::read_structure_file(args.pdb);
-    gemmi::UnitCell& cell = st.cell;
+    UnitCell cell{};
+    std::vector<float> xs, ys, zs, Bs;
+    std::vector<int>   els;
+    if (!read_pdb(args.pdb.c_str(), cell, xs, ys, zs, Bs, els)) return 1;
+
     double ax = cell.a, ay = cell.b, az = cell.c;
     fprintf(stderr, "  Supercell: %.3f x %.3f x %.3f  angles: %.2f %.2f %.2f\n",
             ax, ay, az, cell.alpha, cell.beta, cell.gamma);
 
-    // Primitive cell
-    gemmi::UnitCell prim_cell(ax/na, ay/nb, az/nc, cell.alpha, cell.beta, cell.gamma);
+    UnitCell prim_cell{ax/na, ay/nb, az/nc, cell.alpha, cell.beta, cell.gamma};
     fprintf(stderr, "  super_mult: %d x %d x %d\n", na, nb, nc);
     fprintf(stderr, "  Primitive cell: %.3f x %.3f x %.3f\n",
             prim_cell.a, prim_cell.b, prim_cell.c);
     fprintf(stderr, "  Space group: %s\n", sg->xhm());
-
-    // Extract atoms
-    std::vector<float> xs, ys, zs, Bs;
-    std::vector<int>   els;
-    for (auto& model : st.models)
-        for (auto& chain : model.chains)
-            for (auto& res : chain.residues)
-                for (auto& atom : res.atoms) {
-                    xs.push_back((float)atom.pos.x);
-                    ys.push_back((float)atom.pos.y);
-                    zs.push_back((float)atom.pos.z);
-                    Bs.push_back(std::max(0.f, atom.b_iso));
-                    els.push_back(elem_idx(atom.element.uname()));
-                }
 
     int natoms = (int)xs.size();
     float B_min = *std::min_element(Bs.begin(), Bs.end());
@@ -523,7 +749,7 @@ int main(int argc, char** argv) {
 
     int nx = levels[0].nx, ny = levels[0].ny, nz = levels[0].nz;
     int nx2 = nx/2 + 1;
-    double V_cell = cell.volume;
+    double V_cell = cell.volume();
     double w_px   = noise_wpx(noise);
 
     int last_occ = 0;
@@ -571,7 +797,6 @@ int main(int argc, char** argv) {
     std::vector<float> acc_im(acc_size, 0.f);
 
     for (int L = 0; L <= last_occ; L++) {
-        // collect atoms for this level
         std::vector<float> lx, ly, lz, lB;
         std::vector<int>   lel;
         for (int i = 0; i < natoms; i++) {
@@ -587,12 +812,8 @@ int main(int argc, char** argv) {
         size_t fft_n = (size_t)NX2 * NY * NZ;
 
         std::vector<float> Fr(fft_n), Fi(fft_n);
-        std::vector<float> map_buf;
         float* map_ptr = nullptr;
-        if (!args.outmap.empty() && L == 0) {
-            map_buf.resize((size_t)NX * NY * NZ);
-            map_ptr = map_buf.data();
-        }
+        // (map output not yet implemented — requires CCP4 map writer)
 
         int nkept = spread_and_fft(
             n_L,
@@ -619,10 +840,6 @@ int main(int argc, char** argv) {
                 acc_re[j] += Fr[j];
                 acc_im[j] += Fi[j];
             }
-            if (map_ptr) {
-                // store map_buf for later (write CCP4 map) — not yet implemented
-                // TODO: write CCP4 map via gemmi
-            }
         } else {
             add_to_fine(acc_re.data(), acc_im.data(), nx, ny, nz,
                         Fr.data(), Fi.data(), NX, NY, NZ);
@@ -633,7 +850,7 @@ int main(int argc, char** argv) {
     // 5. Apply blur correction: F(H) *= exp(+b_add * stol^2)
     // -----------------------------------------------------------------------
     {
-        gemmi::UnitCell rc = cell.reciprocal();
+        UnitCell rc = cell.reciprocal();
         float cg = (float)cos(rc.gamma * M_PI / 180.0);
         float cb = (float)cos(rc.beta  * M_PI / 180.0);
         float ca = (float)cos(rc.alpha * M_PI / 180.0);
@@ -650,18 +867,15 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     fprintf(stderr, "Extracting supercell structure factors ...\n");
 
-    // Reciprocal metric for supercell (for resolution filter)
-    double inv_dmin2 = 1.0 / (dmin * dmin);
-    // For orthogonal-like: inv_d2 = (H/ax)^2 + (K/ay)^2 + (L/az)^2
-    // Use exact reciprocal metric
-    gemmi::UnitCell rc_sc = cell.reciprocal();
+    UnitCell rc_sc = cell.reciprocal();
     double rca = cos(rc_sc.alpha * M_PI / 180.0);
     double rcb = cos(rc_sc.beta  * M_PI / 180.0);
     double rcg = cos(rc_sc.gamma * M_PI / 180.0);
     double m11 = rc_sc.a*rc_sc.a, m22 = rc_sc.b*rc_sc.b, m33 = rc_sc.c*rc_sc.c;
     double m12 = rc_sc.a*rc_sc.b*rcg, m13 = rc_sc.a*rc_sc.c*rcb, m23 = rc_sc.b*rc_sc.c*rca;
+    double inv_dmin2 = 1.0 / (dmin * dmin);
 
-    std::vector<HKL>  sc_hkl;
+    std::vector<int>   sc_h, sc_k, sc_l;
     std::vector<float> sc_I;
 
     for (int iz = 0; iz < nz; iz++) {
@@ -670,7 +884,6 @@ int main(int argc, char** argv) {
             int K = (iy <= ny/2) ? iy : iy - ny;
             for (int ix = 0; ix < nx2; ix++) {
                 int H = ix;
-                // P1 ASU: L>0, or L==0 K>0, or L==0 K==0 H>0
                 bool in_asu = (L > 0) || (L == 0 && K > 0) || (L == 0 && K == 0 && H > 0);
                 if (!in_asu) continue;
                 double inv_d2 = H*H*m11 + K*K*m22 + L*L*m33
@@ -679,14 +892,14 @@ int main(int argc, char** argv) {
 
                 size_t idx = (size_t)iz * ny * nx2 + iy * nx2 + ix;
                 float re = acc_re[idx], im = acc_im[idx];
-                sc_hkl.push_back({H, K, L});
+                sc_h.push_back(H); sc_k.push_back(K); sc_l.push_back(L);
                 sc_I.push_back(re*re + im*im);
             }
         }
     }
 
     if (!args.outI.empty())
-        write_mtz_I(sc_hkl, sc_I, cell, args.outI);
+        write_mtz_intensity(sc_h, sc_k, sc_l, sc_I, cell, args.outI);
 
     // -----------------------------------------------------------------------
     // 7. Collapse to primitive-cell ASU → write phased MTZ
@@ -694,18 +907,18 @@ int main(int argc, char** argv) {
     bool simple_p1 = (na == 1 && nb == 1 && nc == 1 && std::string(sg->hm) == "P 1");
 
     if (simple_p1) {
-        int n = (int)sc_hkl.size();
+        int n = (int)sc_h.size();
         std::vector<float> amp(n), phi(n);
         for (int i = 0; i < n; i++) {
             size_t idx = (size_t)
-                ((sc_hkl[i].l < 0 ? sc_hkl[i].l + nz : sc_hkl[i].l)) * ny * nx2
-                + ((sc_hkl[i].k < 0 ? sc_hkl[i].k + ny : sc_hkl[i].k)) * nx2
-                + sc_hkl[i].h;
+                ((sc_l[i] < 0 ? sc_l[i] + nz : sc_l[i])) * ny * nx2
+                + ((sc_k[i] < 0 ? sc_k[i] + ny : sc_k[i])) * nx2
+                + sc_h[i];
             float re = acc_re[idx], im = acc_im[idx];
             amp[i] = sqrtf(re*re + im*im);
             phi[i] = atan2f(im, re) * (float)(180.0 / M_PI);
         }
-        write_mtz(sc_hkl, amp, phi, cell, sg, args.outmtz);
+        write_mtz_phased(sc_h, sc_k, sc_l, amp, phi, cell, sg, args.outmtz);
     } else {
         fprintf(stderr, "Collapsing supercell to primitive-cell ASU (%s, %d operators) ...\n",
                 sg->xhm(), (int)sg->operations().order());
@@ -718,11 +931,13 @@ int main(int argc, char** argv) {
 
         int n = (int)asu_refl.size();
         std::vector<float> amp(n), phi(n);
+        std::vector<int> rh(n), rk(n), rl(n);
         for (int i = 0; i < n; i++) {
+            rh[i] = asu_refl[i].h; rk[i] = asu_refl[i].k; rl[i] = asu_refl[i].l;
             amp[i] = sqrtf(F_re[i]*F_re[i] + F_im[i]*F_im[i]);
             phi[i] = atan2f(F_im[i], F_re[i]) * (float)(180.0 / M_PI);
         }
-        write_mtz(asu_refl, amp, phi, prim_cell, sg, args.outmtz);
+        write_mtz_phased(rh, rk, rl, amp, phi, prim_cell, sg, args.outmtz);
     }
 
     dlclose(gpu_lib);

@@ -37,9 +37,10 @@ Two MTZ files are written per frame:
 ## Requirements
 
 - **NVIDIA GPU**, compute capability 7.0+ (Volta, Turing, Ampere, Ada, Hopper)
-- **CCP4 suite** — for `ccp4-python` (provides Python, numpy, and gemmi)
+- **CCP4 suite** — provides `libgemmi_cpp.so` (runtime) and gemmi headers (build)
 - **CUDA driver** 520+ (CUDA 11 runtime is bundled in `libcufft.so.11`)
-- `sfcalc_gpu.so` and `libcufft.so.11` in the same directory (see Build)
+- **GCC 7+** for building `sfcalc_gpu_collapse.cpp` (devtoolset-7 on RHEL/CentOS 7)
+- `sfcalc_gpu.so`, `libcufft.so.11`, and `sfcalc_gpu_collapse` in the same directory (see Build)
 
 ## Build
 
@@ -49,14 +50,16 @@ Compile once on a machine with the CUDA toolkit installed (e.g. voltron):
 tcsh compile_gpu.csh
 ```
 
-This produces `sfcalc_gpu.so` (multi-arch: sm_70 through sm_90 + PTX fallback).
+This produces:
+- `sfcalc_gpu.so` (multi-arch: sm_70 through sm_90 + PTX fallback)
+- `sfcalc_gpu_collapse` (C++ executable, linked against `libgemmi_cpp.so`)
 
-**Distribution**: ship `sfcalc_gpu.so` and `libcufft.so.11` together in the same directory. The `$ORIGIN` rpath in `sfcalc_gpu.so` means the CUDA toolkit does not need to be installed on the target machine — only an NVIDIA driver is required.
+**Distribution**: ship `sfcalc_gpu.so`, `libcufft.so.11`, and `sfcalc_gpu_collapse` together in the same directory. The `$ORIGIN` rpath means neither the CUDA toolkit nor the CCP4 suite needs to be installed on the target machine — only an NVIDIA driver is required.
 
 ## Usage
 
 ```
-ccp4-python sfcalc_gpu_collapse.py  <input.pdb>
+./sfcalc_gpu_collapse  <input.pdb>
     [dmin=1.5]          resolution limit in Angstroms (default 1.5)
     [rate=2.5]          Shannon rate (grid oversampling, default 2.5)
     [sg=P1]             space group of the PRIMITIVE cell
@@ -72,7 +75,7 @@ ccp4-python sfcalc_gpu_collapse.py  <input.pdb>
 ### Example: orthorhombic 2×2×2 supercell
 
 ```csh
-ccp4-python sfcalc_gpu_collapse.py  frame_001.pdb \
+./sfcalc_gpu_collapse  frame_001.pdb \
     sg="P 21 21 21"  super_mult=2,2,2  dmin=2.0 \
     outmtz=frame_001_collapsed.mtz  outI=frame_001_I.mtz
 ```
@@ -82,6 +85,16 @@ The input PDB must be a P1 supercell with `CRYST1` giving the supercell dimensio
 ### P1 single-cell calculation
 
 If `super_mult=1,1,1` and `sg=P1`, both outputs cover the same P1 ASU reflections and the collapse step is skipped.
+
+### Python alternative
+
+The Python script `sfcalc_gpu_collapse.py` accepts identical arguments and produces identical output, but has ~400 ms additional startup overhead per frame (Python + gemmi import):
+
+```csh
+ccp4-python sfcalc_gpu_collapse.py  frame_001.pdb \
+    sg="P 21 21 21"  super_mult=2,2,2  dmin=2.0 \
+    outmtz=frame_001_collapsed.mtz  outI=frame_001_I.mtz
+```
 
 ## Averaging over an MD trajectory
 
@@ -116,15 +129,32 @@ The IT92 form factors include a constant term `c` (effective `b = 0`) that would
 
 ## Performance
 
-Benchmarked on an NVIDIA Volta GPU (sm_70) with the same 1000-atom 170 Å cell:
+Benchmarked on an NVIDIA Volta GPU (sm_70) with a 1000-atom 170 Å orthorhombic P1 cell, `dmin=2.0`, `rate=2.5`:
 
-| Precision | Total wall time | L0 GPU call | L0 FFT kernel |
-|-----------|----------------|-------------|---------------|
-| float64 (D2Z FFT) | 2843 ms | 1626 ms | 11.2 ms |
-| **float32 (R2C FFT)** | **1912 ms** | **1129 ms** | **5.3 ms** |
-| Speedup | **1.49×** | 1.44× | **2.1×** |
+| Implementation | Total wall time | Spreading | FFT |
+|----------------|----------------|-----------|-----|
+| gemmi sfcalc (CPU, single-thread) | 2230 ms | — | — |
+| Python + float64 (D2Z) | 2843 ms | 1626 ms | 11.2 ms |
+| Python + float32 (R2C) | 1912 ms | 1129 ms | 5.3 ms |
+| **C++ + float32 (R2C)** | **1040 ms** | 1129 ms | 5.3 ms |
 
-The pipeline uses float32 throughout (grid accumulation, R2C FFT, output); the per-atom Gaussian evaluation was already float32. Switching from float64/D2Z to float32/R2C halves all device memory sizes (cudaMalloc, cudaMemset, PCIe transfer), which dominates wall time. Accuracy is unaffected: the float32 noise floor (~10⁻⁷) is 2500× below the 0.03% grid-discretisation error.
+### Scaling with atom count
+
+Same cell (170 × 170 × 153 Å, `dmin=2.0`, grid 576×576×512), Volta GPU (sm_70):
+
+| Atoms | gemmi sfcalc (CPU) | phenix.fmodel (CPU) | GPU C++ R2C | GPU speedup |
+|-------|--------------------|---------------------|-------------|-------------|
+| 1 000 | 2.2 s | 13 s | 1.0 s | 2× vs gemmi |
+| 10 000 | 80 s | 19 s | ~3.4 s | ~6× vs phenix |
+| 473 000 ¹ | 39 min | 77 s | ~2.6 s | ~30× vs phenix |
+
+¹ GPU run with `bmax=100` (296k/473k atoms kept); CPU codes processed all 473k.
+
+phenix.fmodel uses FFT-based spreading internally and outperforms gemmi sfcalc at large atom counts, but carries ~13 s of Python/PHIL startup overhead. The GPU kernel eliminates both startup cost and the CPU spreading bottleneck, with growing advantage as atom count increases.
+
+### Implementations compared (1 000-atom baseline)
+
+The Python → C++ port eliminates ~400 ms of Python/gemmi import overhead per frame. Switching from float64/D2Z to float32/R2C halves all device memory sizes (cudaMalloc, cudaMemset, PCIe transfer). The float32 noise floor (~10⁻⁷) is 2500× below the 0.03% grid-discretisation error, so accuracy is unaffected.
 
 For a 10 000-atom MD trajectory at `dmin=2.0` with a 2×2×2 supercell (~150 Å cell), expect roughly 5–10 s per frame on a modern NVIDIA GPU.
 
@@ -147,10 +177,12 @@ Pass criteria: ≥90% of gemmi reflections found, mean relative amplitude differ
 
 | File | Purpose |
 |------|---------|
-| `sfcalc_gpu_collapse.py` | Main Python script |
-| `sfcalc_gpu.cu` | CUDA C source |
+| `sfcalc_gpu_collapse` | **Main executable** (C++, no Python required) |
+| `sfcalc_gpu_collapse.cpp` | C++ source for the main executable |
+| `sfcalc_gpu_collapse.py` | Python equivalent (identical interface, ~400 ms slower startup) |
+| `sfcalc_gpu.cu` | CUDA C source for GPU FFT kernel |
 | `sfcalc_gpu.so` | Compiled GPU shared library |
 | `libcufft.so.11` | cuFFT runtime (bundled for portability) |
-| `compile_gpu.csh` | Build script (run on GPU machine) |
+| `compile_gpu.csh` | Build script (run on GPU machine with CUDA toolkit) |
 | `test_one_sg.py` | Per-space-group validation |
 | `test_all_sg.py` | Full 230 SG test suite |
