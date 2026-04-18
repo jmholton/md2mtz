@@ -37,7 +37,7 @@ Two MTZ files are written per frame:
 ## Requirements
 
 - **NVIDIA GPU**, compute capability 7.0+ (Volta, Turing, Ampere, Ada, Hopper)
-- **CCP4 suite** — provides `libgemmi_cpp.so` (runtime) and gemmi headers (build)
+- **CCP4 suite** — only needed to run `sfcalc_gpu_collapse.py` (Python alternative); not required for the C++ executable
 - **CUDA driver** 520+ (CUDA 11 runtime is bundled in `libcufft.so.11`)
 - **GCC 7+** for building `sfcalc_gpu_collapse.cpp` (devtoolset-7 on RHEL/CentOS 7)
 - `sfcalc_gpu.so`, `libcufft.so.11`, and `sfcalc_gpu_collapse` in the same directory (see Build)
@@ -52,7 +52,7 @@ tcsh compile_gpu.csh
 
 This produces:
 - `sfcalc_gpu.so` (multi-arch: sm_70 through sm_90 + PTX fallback)
-- `sfcalc_gpu_collapse` (C++ executable, linked against `libgemmi_cpp.so`)
+- `sfcalc_gpu_collapse` (C++ executable, no external runtime dependencies)
 
 **Distribution**: ship `sfcalc_gpu.so`, `libcufft.so.11`, and `sfcalc_gpu_collapse` together in the same directory. The `$ORIGIN` rpath means neither the CUDA toolkit nor the CCP4 suite needs to be installed on the target machine — only an NVIDIA driver is required.
 

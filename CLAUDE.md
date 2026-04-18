@@ -15,17 +15,18 @@ Diffuse scatter: `I_diffuse(H) = <|F_SG(H)|²> - |<F_SG(H)>|²`
 
 | File | Purpose |
 |------|---------|
-| `sfcalc_gpu_collapse.py` | Main script: reads PDB, calls GPU FFT, collapses to ASU |
+| `sfcalc_gpu_collapse` | **Primary executable** (C++, standalone, no CCP4 needed) |
+| `sfcalc_gpu_collapse.cpp` | C++ source — custom PDB reader, MTZ writer, symmetry via vendored gemmi headers |
+| `sfcalc_gpu_collapse.py` | Python equivalent (identical interface, ~400 ms slower startup; needs CCP4) |
 | `sfcalc_gpu.cu` | CUDA source for the GPU FFT kernel |
-| `sfcalc_gpu.so` | Compiled shared library (compile on voltron only) |
-| `sfcalc_gpu.py` | Older P1-only GPU sfcalc (reference/comparison) |
+| `sfcalc_gpu.so` | Compiled GPU shared library (loaded at runtime via dlopen) |
+| `include/gemmi/` | Vendored gemmi headers: `symmetry.hpp` + `fail.hpp` only (MPL 2.0) |
 | `compile_gpu.csh` | Compilation script — run on voltron, not via srun |
 | `test_one_sg.py` | Test one space group: GPU collapse vs gemmi sfcalc |
 | `test_all_sg.py` | Run test_one_sg.py for all 230 SGs in parallel |
-| `check_asu.py` | Diagnostic: print gemmi ASU reflections for a SG |
-| `diag_ratio.py` | Diagnostic: print FC ratio between two MTZ files |
-| `dump_mtz_hkl.py` | Diagnostic: print first 20 HKL from an MTZ |
 | `compare_mtz.py` | Compare two MTZ files (used by test_one_sg.py) |
+| `check_phenix_accuracy.py` | Compare phenix.fmodel vs gemmi reference MTZ |
+| `diag_phenix.py` | General pairwise MTZ amplitude comparator |
 
 ## Collapse Formula
 
@@ -35,12 +36,24 @@ F_SG(H,K,L) = Σ_op  exp(2πi H·t_op) * F_super(na*R_op^T · H, nb*..., nc*...)
 
 where `t_op` is the translational part of each symmetry operator (in fractional coords) and `(na,nb,nc)` are the supercell multipliers.
 
+## Dependencies and Architecture
+
+**sfcalc_gpu_collapse (C++) has NO external runtime dependencies** beyond an NVIDIA driver:
+
+- Gemmi symmetry tables: vendored as `include/gemmi/symmetry.hpp` + `fail.hpp` (header-only, all 230 SG tables inline). Only these two files are needed — `symmetry.hpp` only includes `fail.hpp`.
+- PDB reading: custom ~100-line parser (CRYST1, ATOM/HETATM) in `sfcalc_gpu_collapse.cpp`.
+- MTZ writing: custom ~150-line binary MTZ writer in `sfcalc_gpu_collapse.cpp`.
+- GPU library: `sfcalc_gpu.so` is loaded at **runtime via dlopen** (not linked at compile time). This is intentional — if it were a link-time dependency, the dynamic linker would try to find it before `dlopen` runs. The g++ command uses only `-ldl -lm`.
+
+**Distribution**: ship `sfcalc_gpu.so`, `libcufft.so.11`, and `sfcalc_gpu_collapse` in the same directory. `$ORIGIN` rpath in `sfcalc_gpu.so` finds `libcufft.so.11`.
+
 ## Environment
 
 - **GPU machine**: voltron (remote, SSH)
 - **Python**: `ccp4-python` (CCP4-bundled Python with gemmi, numpy, etc.)
 - **Shell on voltron**: tcsh
 - **CUDA**: sourced via `/programs/cuda/setup_cuda.csh`
+- **/programs/ is NFS-mounted locally** — copy files from /programs/ with local `cp`, no SSH needed.
 
 ## SSH Rule
 
@@ -64,7 +77,9 @@ Keep SSH command strings simple. If logic is needed, write a `.csh` script and c
 ssh voltron "cd /home/jamesh/projects/fft_symmetry/claude_test ; tcsh compile_gpu.csh"
 ```
 
-Compiles `sfcalc_gpu.cu` → `sfcalc_gpu.so` (sm_70 architecture, cufft).
+Produces:
+- `sfcalc_gpu.so` — multi-arch GPU library (sm_70 through sm_90 + PTX fallback)
+- `sfcalc_gpu_collapse` — C++ executable, compiled with devtoolset-7 g++, links only `-ldl -lm`
 
 ## Test
 
@@ -84,14 +99,43 @@ Pass criteria: ≥90% common reflections, mean relative diff <0.5%, max relative
 failures — all statistical; re-running individually gives PASS (confirmed for SG 47, 199, 221).
 The typical failure mode is a near-zero |F| at one reflection, giving a huge relative error.
 
-**Auto-blur correction implemented (2026-04-09):** `sfcalc_gpu_collapse.py` now adds
-`b_add = (dmin*rate)²/π² = 2.533 Å²` to all B-factors before spreading (prevents sub-pixel
-Gaussians), then corrects by multiplying each F(H) by `exp(+b_add·stol²)` after FFT.
-Accuracy improvement: F>100 mean error dropped from ~0.75% → ~0.03% for 1000-atom structures.
+**Auto-blur correction (implemented 2026-04-09):** `b_add = (dmin*rate)²/π² = 2.533 Å²` is
+added to all B-factors before spreading, then divided out after FFT. This keeps all Gaussian
+components above the pixel size (σ_eff/pixel ≥ 1.37). F>100 mean error: ~0.75% → ~0.03%.
+
+## Accuracy vs Other Programs (2026-04-18)
+
+Benchmarked on 1000-atom 170 Å P1 cell, dmin=2.0, vs gemmi direct-sum reference:
+
+| F bin | this code | phenix.fmodel (default) |
+|-------|-----------|-------------------------|
+| F ≥ 100 | **0.03%** | 0.53% |
+| [10, 100) | 0.13% | 1.23% |
+
+**Root cause of phenix inaccuracy: coarser FFT grid.**
+phenix `grid_resolution_factor=1/3` → pixel=0.665 Å (256×256×240 grid).
+This code rate=2.5 → pixel=0.296 Å (576×576×512 grid).
+The narrowest IT92 Gaussian for C at B=10 has σ=0.37 Å, which is sub-pixel on phenix's grid
+(σ/pixel=0.55) even after phenix's auto-blur (b_add=0.91 Å²). Sub-pixel Gaussians alias.
+Switching phenix to `scattering_table=it1992` only reduced F≥100 error from 0.53% → 0.36%;
+form factors are a minor contributor. Grid coarseness is the dominant cause.
+
+## Performance (2026-04-18)
+
+Same 170 Å P1 cell, dmin=2.0, Volta GPU (sm_70):
+
+| Atoms | gemmi sfcalc | phenix.fmodel | GPU C++ |
+|-------|-------------|---------------|---------|
+| 1 000 | 2.2 s | 13 s | **1.0 s** |
+| 10 000 | 80 s | 19 s | ~3.4 s |
+| 473 000 | 39 min | 77 s | ~2.6 s¹ |
+
+¹ GPU run with bmax=100 (296k/473k atoms kept).
+phenix faster than gemmi for large N (FFT-based internally) but carries ~13 s Python startup.
 
 ## ASU Enumeration (build_prim_asu)
 
-**Use `gemmi.ReciprocalAsu(sg).is_in((H,K,L))`** — takes a plain tuple, not a `gemmi.Miller`.  
+**Use `gemmi.ReciprocalAsu(sg).is_in((H,K,L))`** — takes a plain tuple, not a `gemmi.Miller`.
 **Use `sg.operations().is_systematically_absent((H,K,L))`** — filters extinct reflections.
 
 The old hand-coded `asu_mask_for_laue` (still in the file as dead code) was wrong for many
