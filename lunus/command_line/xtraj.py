@@ -18,6 +18,8 @@ import mmtbx.utils
 import mmtbx.model
 from cctbx import maptbx
 import copy
+import ctypes
+import math
 import mdtraj as md
 import time
 import numpy as np
@@ -28,7 +30,6 @@ from cctbx import crystal
 import cctbx.sgtbx
 import subprocess
 import pickle
-import h5py
 
 def mpi_enabled():
   return 'OMPI_COMM_WORLD_SIZE' in os.environ.keys()
@@ -352,6 +353,46 @@ if __name__=="__main__":
   else:
     engine = args.pop(idx).split("=")[1]
 
+# GPU parameters (used when engine="gpu")
+
+  try:
+    idx = [a.find("rate")==0 for a in args].index(True)
+  except ValueError:
+    gpu_rate = 2.5
+  else:
+    gpu_rate = float(args.pop(idx).split("=")[1])
+
+  try:
+    idx = [a.find("noise")==0 for a in args].index(True)
+  except ValueError:
+    gpu_noise = 0.01
+  else:
+    gpu_noise = float(args.pop(idx).split("=")[1])
+
+  try:
+    idx = [a.find("bmax")==0 for a in args].index(True)
+  except ValueError:
+    gpu_bmax = 0.0
+  else:
+    gpu_bmax = float(args.pop(idx).split("=")[1])
+
+  try:
+    idx = [a.find("lib")==0 for a in args].index(True)
+  except ValueError:
+    gpu_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           '../../md2mtz/sfcalc_gpu.so')
+  else:
+    gpu_lib = args.pop(idx).split("=")[1]
+
+  try:
+    idx = [a.find("super_mult")==0 for a in args].index(True)
+  except ValueError:
+    gpu_super_mult = (1, 1, 1)
+  else:
+    _parts = [p.strip() for p in
+              args.pop(idx).split("=")[1].replace('x', ',').split(',')]
+    gpu_super_mult = tuple(int(p) for p in _parts)
+
 # Calculate difference with respect to reference (for optimization)
 
   try:
@@ -599,8 +640,120 @@ EOF
     
   ti = md.iterload(traj_file,chunk=chunklist[work_rank],top=top_file,skip=skiplist[work_rank])
 
+# GPU engine one-time setup (before the frame loop)
+
+  if engine == "gpu":
+    _md2mtz_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               '../../md2mtz')
+    sys.path.insert(0, _md2mtz_dir)
+    from sfcalc_gpu_collapse import (
+        compute_levels, noise_wpx, assign_levels,
+        b_threshold_for_level, run_gpu_raw, add_to_fine,
+        build_prim_asu, collapse_to_prim_asu, LEVEL_FACTOR,
+    )
+    import gemmi as _gemmi
+
+    _uc_params = xrs_sel.unit_cell().parameters()
+    _ax, _ay, _az = _uc_params[0], _uc_params[1], _uc_params[2]
+    _alpha, _beta, _gamma = _uc_params[3], _uc_params[4], _uc_params[5]
+    _na, _nb, _nc = gpu_super_mult
+
+    _sg_str = str(xrs_sel.crystal_symmetry().space_group_info())
+    _sg = _gemmi.find_spacegroup_by_name(_sg_str)
+    if _sg is None:
+      sys.exit("GPU engine: unknown space group '%s'" % _sg_str)
+    _prim_cell = _gemmi.UnitCell(_ax/_na, _ay/_nb, _az/_nc,
+                                 _alpha, _beta, _gamma)
+    _super_cell = _gemmi.UnitCell(_ax, _ay, _az, _alpha, _beta, _gamma)
+
+    # Atom selection indices (into the full trajectory atom list)
+    _sel_np = np.array(selection)
+    _sel_idx = np.where(_sel_np)[0]
+
+    # Element types for GPU form-factor table
+    _ELEM = {'C': 0, 'H': 1, 'N': 2, 'O': 3, 'P': 4, 'S': 5}
+    _el_arr = np.array(
+        [_ELEM.get(sc.scattering_type.strip().upper()[:1], 0)
+         for sc in xrs_sel.scatterers()],
+        dtype=np.int32)
+
+    # B factors matching xtraj's apply_bfac / use_top_bfacs logic
+    if apply_bfac:
+      _B_arr = np.full(len(_sel_idx), 20.0 * d_min * d_min, dtype=np.float32)
+    elif use_top_bfacs:
+      _B_arr = np.array([sc.b_iso for sc in xrs_sel.scatterers()],
+                        dtype=np.float32)
+    else:
+      _B_arr = np.zeros(len(_sel_idx), dtype=np.float32)
+    _B_arr = np.maximum(_B_arr, 0.0)
+
+    # Optional B-factor cutoff (drops very diffuse atoms from GPU spreading)
+    if gpu_bmax > 0:
+      _bmax_mask = _B_arr <= gpu_bmax
+      _el_arr  = _el_arr[_bmax_mask]
+      _B_arr   = _B_arr[_bmax_mask]
+      _sel_idx = _sel_idx[_bmax_mask]
+
+    # Auto-blur: add b_add to all B so no Gaussian is sub-pixel;
+    # the corresponding exp(-b_add*stol^2) envelope is divided out after FFT.
+    _b_add = (d_min * gpu_rate) ** 2 / math.pi ** 2
+    _B_arr_spread = _B_arr + np.float32(_b_add)
+
+    # Multi-grid level assignment (constant across frames — only B matters)
+    _levels    = compute_levels(d_min, gpu_rate, _ax, _ay, _az)
+    _n_levels  = len(_levels)
+    _pixel_fine = d_min / (2.0 * gpu_rate)
+    _atom_lev  = assign_levels(_B_arr_spread, _pixel_fine, gpu_noise, _n_levels)
+    _d0, _nx, _ny, _nz = _levels[0]
+    _nx2   = _nx // 2 + 1
+    _V_cell = xrs_sel.unit_cell().volume()
+
+    # Blur-correction grid (constant — depends only on cell and dmin, not coords)
+    _H_c  = np.arange(_nx2, dtype=np.float64)[None, None, :]
+    _K_1d = np.arange(_ny,  dtype=np.float64)
+    _L_1d = np.arange(_nz,  dtype=np.float64)
+    _K_c  = np.where(_K_1d > _ny//2, _K_1d - _ny, _K_1d)[None, :, None]
+    _L_c  = np.where(_L_1d > _nz//2, _L_1d - _nz, _L_1d)[:, None, None]
+    _rc_s = _super_cell.reciprocal()
+    _cg = math.cos(math.radians(_rc_s.gamma))
+    _cb = math.cos(math.radians(_rc_s.beta))
+    _ca = math.cos(math.radians(_rc_s.alpha))
+    _stol2_g = 0.25 * (
+        _H_c**2 * _rc_s.a**2 + _K_c**2 * _rc_s.b**2 + _L_c**2 * _rc_s.c**2
+        + 2.0 * (_H_c * _K_c * _rc_s.a * _rc_s.b * _cg
+                 + _H_c * _L_c * _rc_s.a * _rc_s.c * _cb
+                 + _K_c * _L_c * _rc_s.b * _rc_s.c * _ca))
+    _blur_corr = np.exp(_b_add * _stol2_g)
+
+    # Load GPU shared library
+    _lib = ctypes.CDLL(gpu_lib)
+    _lib.spread_and_fft.restype  = ctypes.c_int
+    _lib.spread_and_fft.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,
+        ctypes.c_float,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+
+    # ASU reflection list — built once, shared across all frames
+    _H_asu, _K_asu, _L_asu = build_prim_asu(_sg, _prim_cell, d_min)
+    if mpi_rank == 0:
+      print("GPU engine: %d ASU reflections, grid %dx%dx%d, %d level(s), "
+            "b_add=%.3f A^2" % (len(_H_asu), _nx, _ny, _nz, _n_levels, _b_add))
+
+    # Per-rank running sums (complex F and intensity |F|^2)
+    _sig_fcalc_np = np.zeros(len(_H_asu), dtype=np.complex128)
+    _sig_icalc_np = np.zeros(len(_H_asu), dtype=np.float64)
+
 # Each MPI rank works with its own trajectory chunk t
-  
+
   chunk_ct = 0
   fcalc_list = None
   
@@ -707,11 +860,59 @@ EOF
           hkl_in = any_reflection_file(file_name=fcalcnam_tmp)
           miller_arrays = hkl_in.as_miller_arrays()
           fcalc = miller_arrays[1]
+        elif engine == "gpu":
+          # Coordinates: use post-fit cart if translational_fit, else raw traj
+          if translational_fit:
+            _all_xyz = xrs.sites_cart().as_double().as_numpy_array().reshape(-1, 3)
+          else:
+            _all_xyz = tsites[i]
+          _x = _all_xyz[_sel_idx, 0].astype(np.float32)
+          _y = _all_xyz[_sel_idx, 1].astype(np.float32)
+          _z = _all_xyz[_sel_idx, 2].astype(np.float32)
+
+          # Multi-level GPU spreading + FFT
+          _acc_r = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+          _acc_i = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+          for _L, (_d_L, _nx_L, _ny_L, _nz_L) in enumerate(_levels):
+            _mask_L = (_atom_lev == _L)
+            if not _mask_L.any():
+              continue
+            _Fr, _Fi, _, _ = run_gpu_raw(
+                _lib,
+                _x[_mask_L], _y[_mask_L], _z[_mask_L],
+                _B_arr_spread[_mask_L], _el_arr[_mask_L],
+                _nx_L, _ny_L, _nz_L, _ax, _ay, _az,
+                _alpha, _beta, _gamma,
+            )
+            _norm   = np.float32(_V_cell / (_nx_L * _ny_L * _nz_L))
+            _nx_L2  = _nx_L // 2 + 1
+            _Fr3 = (_Fr *  _norm).reshape(_nz_L, _ny_L, _nx_L2)
+            _Fi3 = (_Fi * -_norm).reshape(_nz_L, _ny_L, _nx_L2)
+            if _L == 0:
+              _acc_r += _Fr3
+              _acc_i += _Fi3
+            else:
+              add_to_fine(_acc_r, _nx, _ny, _nz, _Fr3, _nx_L, _ny_L, _nz_L)
+              add_to_fine(_acc_i, _nx, _ny, _nz, _Fi3, _nx_L, _ny_L, _nz_L)
+
+          # Undo auto-blur envelope
+          _acc_r *= _blur_corr
+          _acc_i *= _blur_corr
+
+          # Collapse supercell FFT to primitive-cell ASU
+          _F_re, _F_im = collapse_to_prim_asu(
+              _acc_r, _acc_i, _nx, _ny, _nz,
+              _na, _nb, _nc, _sg, _H_asu, _K_asu, _L_asu)
+
+          # Accumulate running sums: ΣF (complex) and Σ|F|² (intensity)
+          _sig_fcalc_np += _F_re + 1j * _F_im
+          _sig_icalc_np += _F_re**2 + _F_im**2
+
         else:
           xrs_sel.scattering_type_registry(table=scattering_table)
           fcalc = xrs_sel.structure_factors(d_min=d_min).f_calc()
 
-        if do_opt:
+        if do_opt and engine != "gpu":
           diffuse_expt_common,fcalc_common = diffuse_expt.common_sets(fcalc.as_non_anomalous_array())
           icalc_common = abs(fcalc_common).set_observation_type_xray_amplitude().f_as_f_sq()
           fcalc_common_data = np.array(fcalc_common.data())
@@ -728,7 +929,7 @@ EOF
     #      this_map = fcalc.fft_map(d_min=d_min, resolution_factor = 0.5)
     #      real_map_np = this_map.real_map_unpadded().as_numpy_array()
     #      map_data.append(real_map_np)
-        else:
+        elif engine != "gpu":
           if sig_fcalc is None:
             sig_fcalc = fcalc
             sig_icalc = abs(fcalc).set_observation_type_xray_amplitude().f_as_f_sq()
@@ -764,6 +965,23 @@ EOF
   if (mpi_rank == 0):
     mtime = time.time()
     print("TIMING: Calculate individual statistics = ",mtime-itime)
+
+# Convert GPU running sums to cctbx miller arrays so the rest of
+# the pipeline (MPI reduction, DWF removal, MTZ output) works unchanged.
+  if engine == "gpu":
+    from cctbx import miller as _miller_mod
+    from cctbx.xray import observation_types as _obs_types
+    _indices = flex.miller_index(
+        list(zip(_H_asu.tolist(), _K_asu.tolist(), _L_asu.tolist())))
+    _gpu_ms = _miller_mod.set(
+        crystal_symmetry=xrs_sel.crystal_symmetry(),
+        indices=_indices,
+        anomalous_flag=False)
+    sig_fcalc = _gpu_ms.array(
+        data=flex.complex_double(list(_sig_fcalc_np)))
+    sig_icalc = _gpu_ms.array(
+        data=flex.double(list(_sig_icalc_np))).set_observation_type(
+        _obs_types.intensity())
 
 # If optimization is on, calculate sig_fcalc and sig_icalc
   if do_opt:
