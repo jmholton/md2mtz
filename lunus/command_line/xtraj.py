@@ -739,21 +739,18 @@ EOF
               np.array([h[1] for h in idx], dtype=np.int32),
               np.array([h[2] for h in idx], dtype=np.int32))
 
-    def _collapse_to_prim_asu(acc_real, acc_imag, nx, ny, nz,
-                               na, nb, nc, sg, H_asu, K_asu, L_asu):
-      """Collapse supercell FFT to primitive-cell ASU using cctbx symmetry ops."""
+    def _precompute_collapse(nx, ny, nz, na, nb, nc, sg, H_asu, K_asu, L_asu):
+      """Pre-compute per-operator grid indices and phase arrays (constant across frames)."""
       nx2 = nx // 2 + 1
       H = H_asu.astype(np.int64)
       K = K_asu.astype(np.int64)
       L = L_asu.astype(np.int64)
-      F_re = np.zeros(len(H), dtype=np.float64)
-      F_im = np.zeros(len(H), dtype=np.float64)
+      ops_data = []
       for op in sg.all_ops():
-        r     = op.r().num()   # flat 9 ints, row-major, denom r_den
+        r     = op.r().num()
         r_den = op.r().den()
-        t     = op.t().num()   # 3 ints, denom t_den
+        t     = op.t().num()
         t_den = op.t().den()
-        # R^T * (H,K,L): r[3*row+col], so R^T uses r[3*col+row]
         Hr = (r[0]*H + r[3]*K + r[6]*L) // r_den
         Kr = (r[1]*H + r[4]*K + r[7]*L) // r_den
         Lr = (r[2]*H + r[5]*K + r[8]*L) // r_den
@@ -770,12 +767,22 @@ EOF
         ix_s = np.where(valid, ix, 0).astype(np.intp)
         iy_s = np.where(valid, iy, 0).astype(np.intp)
         iz_s = np.where(valid, iz, 0).astype(np.intp)
-        re = np.where(valid, acc_real[iz_s, iy_s, ix_s].astype(np.float64), 0.0)
-        im = np.where(valid, acc_imag[iz_s, iy_s, ix_s].astype(np.float64), 0.0)
-        im = np.where(friedel, -im, im)
         phase = 2.0 * math.pi * (H * t[0] + K * t[1] + L * t[2]) / t_den
-        F_re += re * np.cos(phase) - im * np.sin(phase)
-        F_im += re * np.sin(phase) + im * np.cos(phase)
+        cos_p = np.cos(phase)
+        sin_p = np.sin(phase)
+        ops_data.append((iz_s, iy_s, ix_s, valid, friedel, cos_p, sin_p))
+      return ops_data
+
+    def _collapse_fast(acc_real, acc_imag, ops_data):
+      """Collapse using pre-computed indices — per-frame cost is gather + phase rotate only."""
+      F_re = np.zeros(len(ops_data[0][0]), dtype=np.float64)
+      F_im = np.zeros(len(ops_data[0][0]), dtype=np.float64)
+      for iz_s, iy_s, ix_s, valid, friedel, cos_p, sin_p in ops_data:
+        re = np.where(valid, acc_real[iz_s, iy_s, ix_s], 0.0)
+        im = np.where(valid, acc_imag[iz_s, iy_s, ix_s], 0.0)
+        im = np.where(friedel, -im, im)
+        F_re += re * cos_p - im * sin_p
+        F_im += re * sin_p + im * cos_p
       return F_re, F_im
 
     # ---- cell and symmetry (cctbx, no gemmi needed) -------------------------
@@ -881,6 +888,10 @@ EOF
     # Pre-allocate per-frame FFT accumulators (zeroed each frame, not reallocated)
     _acc_r = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
     _acc_i = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+
+    # Pre-compute collapse indices and phase arrays (constant across frames)
+    _collapse_ops = _precompute_collapse(
+        _nx, _ny, _nz, _na, _nb, _nc, _prim_sg, _H_asu, _K_asu, _L_asu)
 
 # Each MPI rank works with its own trajectory chunk t
 
@@ -1001,6 +1012,7 @@ EOF
           _z = _all_xyz[_sel_idx, 2].astype(np.float32)
 
           # Multi-level GPU spreading + FFT
+          _t0 = time.time()
           _acc_r[:] = 0.0
           _acc_i[:] = 0.0
           for _L, (_d_L, _nx_L, _ny_L, _nz_L) in enumerate(_levels):
@@ -1024,19 +1036,25 @@ EOF
             else:
               _add_to_fine(_acc_r, _nx, _ny, _nz, _Fr3, _nx_L, _ny_L, _nz_L)
               _add_to_fine(_acc_i, _nx, _ny, _nz, _Fi3, _nx_L, _ny_L, _nz_L)
+          _t1 = time.time()
 
           # Undo auto-blur envelope
           _acc_r *= _blur_corr
           _acc_i *= _blur_corr
+          _t2 = time.time()
 
           # Collapse supercell FFT to primitive-cell ASU
-          _F_re, _F_im = _collapse_to_prim_asu(
-              _acc_r, _acc_i, _nx, _ny, _nz,
-              _na, _nb, _nc, _prim_sg, _H_asu, _K_asu, _L_asu)
+          _F_re, _F_im = _collapse_fast(_acc_r, _acc_i, _collapse_ops)
+          _t3 = time.time()
 
           # Accumulate running sums: ΣF (complex) and Σ|F|² (intensity)
           _sig_fcalc_np += _F_re + 1j * _F_im
           _sig_icalc_np += _F_re**2 + _F_im**2
+          _t4 = time.time()
+
+          if ct == 0 and mpi_rank == 0:
+            print("PROFILE frame0: zero+gpu+fft=%.2fs blur=%.2fs collapse=%.2fs accum=%.2fs total=%.2fs" % (
+                _t1-_t0, _t2-_t1, _t3-_t2, _t4-_t3, _t4-_t0))
 
         else:
           xrs_sel.scattering_type_registry(table=scattering_table)
