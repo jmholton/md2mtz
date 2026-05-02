@@ -878,6 +878,10 @@ EOF
     _sig_fcalc_np = np.zeros(len(_H_asu), dtype=np.complex128)
     _sig_icalc_np = np.zeros(len(_H_asu), dtype=np.float64)
 
+    # Pre-allocate per-frame FFT accumulators (zeroed each frame, not reallocated)
+    _acc_r = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+    _acc_i = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+
 # Each MPI rank works with its own trajectory chunk t
 
   chunk_ct = 0
@@ -997,8 +1001,8 @@ EOF
           _z = _all_xyz[_sel_idx, 2].astype(np.float32)
 
           # Multi-level GPU spreading + FFT
-          _acc_r = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
-          _acc_i = np.zeros((_nz, _ny, _nx2), dtype=np.float64)
+          _acc_r[:] = 0.0
+          _acc_i[:] = 0.0
           for _L, (_d_L, _nx_L, _ny_L, _nz_L) in enumerate(_levels):
             _mask_L = (_atom_lev == _L)
             if not _mask_L.any():
