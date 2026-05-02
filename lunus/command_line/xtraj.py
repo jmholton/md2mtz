@@ -840,23 +840,12 @@ EOF
     _nx2   = _nx // 2 + 1
     _V_cell = xrs_sel.unit_cell().volume()
 
-    # Blur-correction grid (constant — depends only on cell and dmin, not coords)
-    _H_c  = np.arange(_nx2, dtype=np.float64)[None, None, :]
-    _K_1d = np.arange(_ny,  dtype=np.float64)
-    _L_1d = np.arange(_nz,  dtype=np.float64)
-    _K_c  = np.where(_K_1d > _ny//2, _K_1d - _ny, _K_1d)[None, :, None]
-    _L_c  = np.where(_L_1d > _nz//2, _L_1d - _nz, _L_1d)[:, None, None]
+    # Reciprocal cell parameters for blur correction
     _rp   = xrs_sel.unit_cell().reciprocal_parameters()
     _rc_a, _rc_b, _rc_c = _rp[0], _rp[1], _rp[2]
     _cg = math.cos(math.radians(_rp[5]))
     _cb = math.cos(math.radians(_rp[4]))
     _ca = math.cos(math.radians(_rp[3]))
-    _stol2_g = 0.25 * (
-        _H_c**2 * _rc_a**2 + _K_c**2 * _rc_b**2 + _L_c**2 * _rc_c**2
-        + 2.0 * (_H_c * _K_c * _rc_a * _rc_b * _cg
-                 + _H_c * _L_c * _rc_a * _rc_c * _cb
-                 + _K_c * _L_c * _rc_b * _rc_c * _ca))
-    _blur_corr = np.exp(_b_add * _stol2_g)
 
     # Load GPU shared library
     _lib = ctypes.CDLL(gpu_lib)
@@ -880,6 +869,17 @@ EOF
     if mpi_rank == 0:
       print("GPU engine: %d ASU reflections, grid %dx%dx%d, %d level(s), "
             "b_add=%.3f A^2" % (len(_H_asu), _nx, _ny, _nz, _n_levels, _b_add))
+
+    # Blur correction at ASU reflections only (replaces full-grid multiply)
+    _Ha = _H_asu.astype(np.float64)
+    _Ka = _K_asu.astype(np.float64)
+    _La = _L_asu.astype(np.float64)
+    _stol2_asu = 0.25 * (
+        _Ha**2 * _rc_a**2 + _Ka**2 * _rc_b**2 + _La**2 * _rc_c**2
+        + 2.0 * (_Ha * _Ka * _rc_a * _rc_b * _cg
+                 + _Ha * _La * _rc_a * _rc_c * _cb
+                 + _Ka * _La * _rc_b * _rc_c * _ca))
+    _blur_asu = np.exp(_b_add * _stol2_asu)
 
     # Per-rank running sums (complex F and intensity |F|^2)
     _sig_fcalc_np = np.zeros(len(_H_asu), dtype=np.complex128)
@@ -1038,23 +1038,24 @@ EOF
               _add_to_fine(_acc_i, _nx, _ny, _nz, _Fi3, _nx_L, _ny_L, _nz_L)
           _t1 = time.time()
 
-          # Undo auto-blur envelope
-          _acc_r *= _blur_corr
-          _acc_i *= _blur_corr
-          _t2 = time.time()
-
           # Collapse supercell FFT to primitive-cell ASU
+          _t2 = time.time()
           _F_re, _F_im = _collapse_fast(_acc_r, _acc_i, _collapse_ops)
           _t3 = time.time()
+
+          # Undo auto-blur envelope at ASU reflections only
+          _F_re *= _blur_asu
+          _F_im *= _blur_asu
+          _t4 = time.time()
 
           # Accumulate running sums: ΣF (complex) and Σ|F|² (intensity)
           _sig_fcalc_np += _F_re + 1j * _F_im
           _sig_icalc_np += _F_re**2 + _F_im**2
-          _t4 = time.time()
+          _t5 = time.time()
 
           if ct == 0 and mpi_rank == 0:
-            print("PROFILE frame0: zero+gpu+fft=%.2fs blur=%.2fs collapse=%.2fs accum=%.2fs total=%.2fs" % (
-                _t1-_t0, _t2-_t1, _t3-_t2, _t4-_t3, _t4-_t0))
+            print("PROFILE frame0: zero+gpu+fft=%.2fs collapse=%.2fs blur_asu=%.2fs accum=%.2fs total=%.2fs" % (
+                _t1-_t0, _t3-_t2, _t4-_t3, _t5-_t4, _t5-_t0))
 
         else:
           xrs_sel.scattering_type_registry(table=scattering_table)
