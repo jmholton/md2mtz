@@ -292,6 +292,15 @@ def main():
             a[keep] for a in (x_arr, y_arr, z_arr, B_arr, el_arr))
         natoms = int(keep.sum())
 
+    # Auto-blur: add b_add to all B-factors so no Gaussian is sub-pixel;
+    # corrected after FFT by multiplying each F(H) by exp(+b_add*stol^2).
+    b_add = (dmin * rate) ** 2 / math.pi ** 2
+    sigma_min = math.sqrt(b_add / (4.0 * math.pi ** 2))
+    pixel_fine_pre = dmin / (2.0 * rate)
+    print(f"  Auto-blur: b_add = {b_add:.4f} A^2  "
+          f"(sigma_min = {sigma_min:.3f} A, pixel = {pixel_fine_pre:.3f} A)")
+    B_arr = B_arr + np.float32(b_add)
+
     # ------------------------------------------------------------------
     # 2. Build multi-grid level table and assign atoms
     # ------------------------------------------------------------------
@@ -454,15 +463,25 @@ def main():
 
     mask = (inv_d2 <= inv_dmin2) & asu_mask
 
-    # Extract directly from float32 accumulators — no complex128 array needed
-    re_sel = acc_real[mask]
-    im_sel = acc_imag[mask]
-    amp    = np.hypot(re_sel, im_sel).astype(np.float32)
-    phi    = np.degrees(np.arctan2(im_sel, re_sel)).astype(np.float32)
+    # Extract at ASU points and apply blur correction there (not to the full grid).
+    re_sel = acc_real[mask].astype(np.float64)
+    im_sel = acc_imag[mask].astype(np.float64)
+    H_sel  = np.broadcast_to(H3, (nz, ny, nx2))[mask].astype(np.float32)
+    K_sel  = np.broadcast_to(K3, (nz, ny, nx2))[mask].astype(np.float32)
+    L_sel  = np.broadcast_to(L3, (nz, ny, nx2))[mask].astype(np.float32)
 
-    H_sel = np.broadcast_to(H3, (nz, ny, nx2))[mask].astype(np.float32)
-    K_sel = np.broadcast_to(K3, (nz, ny, nx2))[mask].astype(np.float32)
-    L_sel = np.broadcast_to(L3, (nz, ny, nx2))[mask].astype(np.float32)
+    rc  = cell.reciprocal()
+    cg  = math.cos(math.radians(rc.gamma))
+    cb  = math.cos(math.radians(rc.beta))
+    ca  = math.cos(math.radians(rc.alpha))
+    Hf  = H_sel.astype(np.float64); Kf = K_sel.astype(np.float64); Lf = L_sel.astype(np.float64)
+    stol2 = 0.25 * (Hf**2 * rc.a**2 + Kf**2 * rc.b**2 + Lf**2 * rc.c**2
+                    + 2.0 * (Hf*Kf*rc.a*rc.b*cg + Hf*Lf*rc.a*rc.c*cb + Kf*Lf*rc.b*rc.c*ca))
+    blur  = np.exp(b_add * stol2)
+    re_sel *= blur; im_sel *= blur
+
+    amp = np.hypot(re_sel, im_sel).astype(np.float32)
+    phi = np.degrees(np.arctan2(im_sel, re_sel)).astype(np.float32)
 
     out_data = np.column_stack([H_sel, K_sel, L_sel, amp, phi])
     print(f"  ASU reflections: {len(out_data)}")

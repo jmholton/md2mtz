@@ -352,6 +352,58 @@ def collapse_to_prim_asu(acc_real, acc_imag, nx, ny, nz,
     return F_re, F_im
 
 
+def precompute_collapse(nx, ny, nz, na, nb, nc, sg, H_asu, K_asu, L_asu):
+    """Pre-compute index and phase arrays for symmetry collapse (call once per setup).
+
+    Returns ops_data: list of (iz_s, iy_s, ix_s, valid, friedel, cos_p, sin_p),
+    one entry per symmetry operator.  Pass to collapse_fast() for each frame.
+    """
+    nx2 = nx // 2 + 1
+    den = gemmi.Op.DEN
+    H = H_asu.astype(np.int64)
+    K = K_asu.astype(np.int64)
+    L = L_asu.astype(np.int64)
+    ops_data = []
+    for op in sg.operations():
+        rot = op.rot; tran = op.tran
+        Hr = (rot[0][0]*H + rot[1][0]*K + rot[2][0]*L) // den
+        Kr = (rot[0][1]*H + rot[1][1]*K + rot[2][1]*L) // den
+        Lr = (rot[0][2]*H + rot[1][2]*K + rot[2][2]*L) // den
+        SH = na * Hr; SK = nb * Kr; SL = nc * Lr
+        friedel = ((SH < 0) | ((SH == 0) & (SK < 0)) |
+                   ((SH == 0) & (SK == 0) & (SL < 0)))
+        SH = np.where(friedel, -SH, SH)
+        SK = np.where(friedel, -SK, SK)
+        SL = np.where(friedel, -SL, SL)
+        ix = SH
+        iy = np.where(SK >= 0, SK, SK + ny).astype(np.int64)
+        iz = np.where(SL >= 0, SL, SL + nz).astype(np.int64)
+        valid = ((ix < nx2) & (iy >= 0) & (iy < ny) & (iz >= 0) & (iz < nz))
+        if not valid.all():
+            n_oor = int((~valid).sum())
+            print(f"    [{op.triplet()}] {n_oor} reflections out of grid range (skipped)")
+        ix_s = np.where(valid, ix, 0).astype(np.intp)
+        iy_s = np.where(valid, iy, 0).astype(np.intp)
+        iz_s = np.where(valid, iz, 0).astype(np.intp)
+        phase = 2.0 * math.pi * (H * tran[0] + K * tran[1] + L * tran[2]) / den
+        cos_p = np.cos(phase); sin_p = np.sin(phase)
+        ops_data.append((iz_s, iy_s, ix_s, valid, friedel, cos_p, sin_p))
+    return ops_data
+
+
+def collapse_fast(acc_real, acc_imag, ops_data):
+    """Symmetry collapse using pre-computed ops_data from precompute_collapse()."""
+    F_re = np.zeros(len(ops_data[0][0]), dtype=np.float64)
+    F_im = np.zeros(len(ops_data[0][0]), dtype=np.float64)
+    for iz_s, iy_s, ix_s, valid, friedel, cos_p, sin_p in ops_data:
+        re = np.where(valid, acc_real[iz_s, iy_s, ix_s].astype(np.float64), 0.0)
+        im = np.where(valid, acc_imag[iz_s, iy_s, ix_s].astype(np.float64), 0.0)
+        im = np.where(friedel, -im, im)
+        F_re += re * cos_p - im * sin_p
+        F_im += re * sin_p + im * cos_p
+    return F_re, F_im
+
+
 # ---------------------------------------------------------------------------
 # Write output MTZ
 # ---------------------------------------------------------------------------
@@ -565,24 +617,12 @@ def main():
     t_end = time.perf_counter()
     print(f"  GPU total: {(t_end-t_start)*1000:.0f} ms  ({nkept_total} atoms spread)")
 
-    # Apply blur correction: multiply every F(H) by exp(+b_add * stol^2)
-    # This undoes the exp(-b_add*stol^2) envelope introduced by the b_add offset.
-    H_c   = np.arange(nx2, dtype=np.float64)[None, None, :]
-    K_1dc = np.arange(ny,  dtype=np.float64)
-    L_1dc = np.arange(nz,  dtype=np.float64)
-    K_c = np.where(K_1dc > ny // 2, K_1dc - ny, K_1dc)[None, :, None]
-    L_c = np.where(L_1dc > nz // 2, L_1dc - nz, L_1dc)[:, None, None]
+    # Blur correction is applied at ASU level below (not to the full grid).
+    # Pre-compute reciprocal metric for stol^2 calculations.
     rc_s = cell.reciprocal()
     cg = math.cos(math.radians(rc_s.gamma))
     cb = math.cos(math.radians(rc_s.beta))
     ca = math.cos(math.radians(rc_s.alpha))
-    stol2_g = 0.25 * (H_c**2 * rc_s.a**2 + K_c**2 * rc_s.b**2 + L_c**2 * rc_s.c**2
-                      + 2.0 * (H_c * K_c * rc_s.a * rc_s.b * cg
-                               + H_c * L_c * rc_s.a * rc_s.c * cb
-                               + K_c * L_c * rc_s.b * rc_s.c * ca))
-    blur_corr = np.exp(b_add * stol2_g)   # shape (nz, ny, nx2)
-    acc_real *= blur_corr
-    acc_imag *= blur_corr
 
     # ------------------------------------------------------------------
     # 5. Write CCP4 map if requested (level-0 atoms only when multi-grid)
@@ -615,14 +655,22 @@ def main():
     asu_p1    = ((L3 > 0) | ((L3 == 0) & (K3 > 0)) | ((L3 == 0) & (K3 == 0) & (H3 > 0)))
     sc_mask   = (inv_d2 <= inv_dmin2) & asu_p1
 
-    re_sc = acc_real[sc_mask];  im_sc = acc_imag[sc_mask]
+    re_sc = acc_real[sc_mask].astype(np.float64)
+    im_sc = acc_imag[sc_mask].astype(np.float64)
     H_sc  = np.broadcast_to(H3, (nz, ny, nx2))[sc_mask].astype(np.float32)
     K_sc  = np.broadcast_to(K3, (nz, ny, nx2))[sc_mask].astype(np.float32)
     L_sc  = np.broadcast_to(L3, (nz, ny, nx2))[sc_mask].astype(np.float32)
 
+    # Apply blur correction at supercell ASU points only (not the full grid)
+    Hf = H_sc.astype(np.float64); Kf = K_sc.astype(np.float64); Lf = L_sc.astype(np.float64)
+    stol2_sc = 0.25 * (Hf**2 * rc_s.a**2 + Kf**2 * rc_s.b**2 + Lf**2 * rc_s.c**2
+                       + 2.0 * (Hf*Kf*rc_s.a*rc_s.b*cg + Hf*Lf*rc_s.a*rc_s.c*cb
+                                + Kf*Lf*rc_s.b*rc_s.c*ca))
+    blur_sc = np.exp(b_add * stol2_sc)
+    re_sc *= blur_sc; im_sc *= blur_sc
+
     if args['outI']:
-        I_sc = (re_sc.astype(np.float64) ** 2 +
-                im_sc.astype(np.float64) ** 2).astype(np.float32)
+        I_sc = (re_sc**2 + im_sc**2).astype(np.float32)
         write_mtz_I(H_sc, K_sc, L_sc, I_sc, cell, args['outI'])
 
     # ------------------------------------------------------------------
@@ -647,11 +695,23 @@ def main():
               f"(enumerated in {(t1-t0)*1000:.0f} ms)")
 
         t0 = time.perf_counter()
-        F_re, F_im = collapse_to_prim_asu(
-            acc_real, acc_imag, nx, ny, nz,
-            na, nb, nc, sg, H_asu, K_asu, L_asu)
+        ops_data = precompute_collapse(nx, ny, nz, na, nb, nc, sg, H_asu, K_asu, L_asu)
+        F_re, F_im = collapse_fast(acc_real, acc_imag, ops_data)
         t1 = time.perf_counter()
         print(f"  Collapse complete in {(t1-t0)*1000:.0f} ms")
+
+        # Apply blur correction at primitive ASU level
+        prim_rc = prim_cell.reciprocal()
+        pcg = math.cos(math.radians(prim_rc.gamma))
+        pcb = math.cos(math.radians(prim_rc.beta))
+        pca = math.cos(math.radians(prim_rc.alpha))
+        Ha = H_asu.astype(np.float64); Ka = K_asu.astype(np.float64); La = L_asu.astype(np.float64)
+        stol2_asu = 0.25 * (Ha**2 * prim_rc.a**2 + Ka**2 * prim_rc.b**2 + La**2 * prim_rc.c**2
+                            + 2.0 * (Ha*Ka*prim_rc.a*prim_rc.b*pcg
+                                     + Ha*La*prim_rc.a*prim_rc.c*pcb
+                                     + Ka*La*prim_rc.b*prim_rc.c*pca))
+        blur_asu = np.exp(b_add * stol2_asu)
+        F_re *= blur_asu; F_im *= blur_asu
 
         amp = np.hypot(F_re, F_im).astype(np.float32)
         phi = np.degrees(np.arctan2(F_im, F_re)).astype(np.float32)
